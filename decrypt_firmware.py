@@ -17,14 +17,16 @@ Scheme discriminator: a legacy image has 32 ASCII spaces at file offset 0x20.
 The newer bodies (Z 5II, Z 50II, Z 6III, ZR) put them at 0x260 and use a
 different, unbroken scheme -- those are rejected here.
 
-Decrypted layout: the 32-byte header, then a module directory of 32-byte
-entries `[BE32 offset][BE32 length][8 pad][16-byte NUL-padded ASCII name]`,
-chained so that offset + length == the next offset.
+Decrypted layout: a 32-byte header, space label, module directory and payloads.
+Named descriptors are 32 bytes; the final, unnamed descriptor is 16 bytes.
+Module extents must chain exactly. Each module and the complete body carry
+CRC16 checksums which are verified before any output is written.
 
 Requires numpy.
 """
 
 import argparse
+import binascii
 import hashlib
 import json
 import re
@@ -38,12 +40,12 @@ SEC = 256           # sector size == T1 period
 TABLE = 0x20        # module directory offset within the body
 NEW_SCHEME = 0x260  # where the newer, unbroken bodies put their 32 spaces
 NAME_RE = re.compile(rb"[0-9A-Za-z_][0-9A-Za-z_.]{2,15}\Z")
-MIN_ZERO_FRACTION = 0.20
+TRAILER = 16       # BE16 body CRC followed by 14 zero bytes
 
 EX_USAGE = 2        # bad arguments or unreadable input
 EX_KEY = 3          # key file rejected
 EX_SCHEME = 4       # input is not a legacy-scheme image
-EX_SANITY = 5       # decrypted, but the result does not look like firmware
+EX_SANITY = 5       # decrypted structure or checksums invalid
 
 
 def die(code, msg):
@@ -108,40 +110,102 @@ def decrypt(raw, t1, t2, t3):
 
 
 def parse_table(plain_body, limit=64):
-    """Read the module directory.
+    """Read a complete module directory, rejecting invalid extents/names.
 
-    At body+0x20 sits a header record, then `count` 32-byte descriptors:
+    At body+0x20 sits a header record, then `count` descriptors:
 
         0x20          [BE32 count][BE32 dirsize][8 pad][16-byte package name]
-        0x20+32*(i+1) [BE32 offset][BE32 length][8 pad][16-byte module name]
+        named:       [BE32 offset][BE32 length][8 pad][16-byte module name]
+        final:       [BE32 offset][BE32 length][8 pad]
 
     dirsize == 48 + 32 * count. Descriptors chain exactly
     (offset + length == next offset) from the first one and close 16 bytes
     before end-of-body. Names are NUL-padded and truncated at 16 characters,
     so a long one loses its extension ("eg1850_mas_01700"); do not require
-    one. The final descriptor is the trailing payload and carries no name.
+    one. Offsets are relative to the body. Lengths include the module CRC.
+    Raises ValueError rather than returning a partial directory.
     """
-    mods = []
-    if len(plain_body) < 0x40:
-        return mods
+    if len(plain_body) < TABLE + 32 + 16 + TRAILER:
+        raise ValueError("truncated module directory or checksum trailer")
     count, dirsize = struct.unpack_from(">II", plain_body, 0x20)
-    if not 0 < count <= limit or dirsize != 48 + 32 * count:
-        return mods
-    for i in range(1, count + 1):
-        off = 0x20 + i * 32
-        if off + 32 > len(plain_body):
-            break
+    if not 0 < count <= limit:
+        raise ValueError("invalid module count %d (expected 1..%d)" % (count, limit))
+    if dirsize != 48 + 32 * count:
+        raise ValueError("directory size %d does not match module count %d"
+                         % (dirsize, count))
+    payload_end = len(plain_body) - TRAILER
+    if dirsize + 2 * count > payload_end:
+        raise ValueError("directory/modules extend beyond the checksum trailer")
+
+    def read_name(raw, label):
+        raw = bytes(raw).rstrip(b"\0")
+        if not NAME_RE.fullmatch(raw):
+            raise ValueError("invalid %s name or NUL padding" % label)
+        return raw.decode("ascii")
+
+    if plain_body[TABLE + 8:TABLE + 16] != b"\0" * 8:
+        raise ValueError("nonzero directory reserved bytes")
+    read_name(plain_body[TABLE + 16:TABLE + 32], "package")
+
+    mods = []
+    expected_start = dirsize
+    for i in range(count):
+        off = TABLE + (i + 1) * 32
         start, length = struct.unpack_from(">II", plain_body, off)
-        raw = plain_body[off + 16:off + 32].rstrip(b"\0")
-        name = raw.decode() if NAME_RE.match(raw) else "(trailer)"
+        if plain_body[off + 8:off + 16] != b"\0" * 8:
+            raise ValueError("module %d has nonzero reserved bytes" % (i + 1))
+        name = (read_name(plain_body[off + 16:off + 32], "module %d" % (i + 1))
+                if i < count - 1 else "(unnamed)")
+        if start != expected_start:
+            raise ValueError("module %d (%s) starts at 0x%x, expected 0x%x"
+                             % (i + 1, name, start, expected_start))
+        if length < 2:
+            raise ValueError("module %d (%s) is too short for its CRC" % (i + 1, name))
+        if start + length > payload_end:
+            raise ValueError("module %d (%s) extends beyond the checksum trailer"
+                             % (i + 1, name))
         mods.append((name, start, length))
+        expected_start = start + length
+    if expected_start != payload_end:
+        raise ValueError("last module ends at 0x%x, expected 0x%x"
+                         % (expected_start, payload_end))
     return mods
+
+
+def validate_firmware(plain_body):
+    """Verify structure and image-supplied CRC16s; return the module table.
+
+    CRC16 uses polynomial 0x1021, seed 0, no final XOR; stored values are BE16.
+    The package CRC covers the entire body except its final 16-byte trailer,
+    including the space label, directory, and each module's own CRC.
+    These are integrity checks, not vendor signature/authenticity checks.
+    """
+    body = memoryview(plain_body)
+    mods = parse_table(body)
+    if body[:TABLE] != b" " * TABLE:
+        raise ValueError("invalid space label")
+    if body[-TRAILER + 2:] != b"\0" * (TRAILER - 2):
+        raise ValueError("nonzero checksum trailer padding")
+    for i, (name, start, length) in enumerate(mods, 1):
+        module = body[start:start + length]
+        stored = struct.unpack_from(">H", module, length - 2)[0]
+        actual = binascii.crc_hqx(module[:-2], 0)
+        if actual != stored:
+            raise ValueError("module %d (%s) CRC mismatch: stored 0x%04x, computed 0x%04x"
+                             % (i, name, stored, actual))
+    stored = struct.unpack_from(">H", body, len(body) - TRAILER)[0]
+    actual = binascii.crc_hqx(body[:-TRAILER], 0)
+    if actual != stored:
+        raise ValueError("package CRC mismatch: stored 0x%04x, computed 0x%04x"
+                         % (stored, actual))
+    return mods
+
 
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__.split("\n")[1],
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Exit codes: 2 usage, 3 bad key, 4 wrong scheme, 5 failed sanity check.")
+        epilog="Exit codes: 2 usage, 3 bad key, 4 wrong scheme, 5 invalid structure/checksums.")
     ap.add_argument("key", help="key JSON from extract_key.py")
     ap.add_argument("firmware", help="encrypted .bin image")
     ap.add_argument("out", help="decrypted output file")
@@ -157,14 +221,15 @@ def main():
     check_scheme(raw, args.firmware)
 
     plain = decrypt(raw, t1, t2, t3)
-    mods = parse_table(plain[HDR:])
+    try:
+        mods = validate_firmware(memoryview(plain)[HDR:])
+    except ValueError as exc:
+        die(EX_SANITY, "%s; nothing written." % exc)
     zero = plain.count(0) / len(plain)
 
     print("module table:")
     for name, off, length in mods:
         print("   %-18s off=0x%08x len=0x%08x" % (name, off, length))
-    if not mods:
-        print("   (none)")
 
     # the module names carry the firmware version, e.g. eg1985_018100.bi for 1.81
     want = re.findall(r"\d+", args.firmware.rsplit("/", 1)[-1])
@@ -173,20 +238,13 @@ def main():
         print("warning: no module name contains the version digits %r from the "
               "input filename" % want)
 
-    if not mods:
-        die(EX_SANITY, "no module name parsed -- the key or the image is wrong; "
-                       "nothing written.")
-    if zero < MIN_ZERO_FRACTION:
-        die(EX_SANITY, "only %.1f%% zero bytes (expected > %.0f%%) -- decryption is "
-                       "wrong; nothing written."
-                       % (100 * zero, 100 * MIN_ZERO_FRACTION))
-
     with open(args.out, "wb") as fh:
         fh.write(plain)
     print("\nwrote %s" % args.out)
     print("  size          %d bytes" % len(plain))
     print("  zero bytes    %.1f%%" % (100 * zero))
     print("  modules       %d (%s)" % (len(mods), ", ".join(m[0] for m in mods)))
+    print("  checksums     %d module CRCs + package CRC verified" % len(mods))
     return 0
 
 

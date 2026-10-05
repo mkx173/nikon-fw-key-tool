@@ -99,26 +99,38 @@ File layout is `[0x20 header][0x20 ASCII-space label][encrypted payload]`.
 The space label is literal plaintext in the container, so it is passed through
 rather than XORed.
 
-The decrypted body opens with a module directory at body `0x20`: a header
-record, then `count` descriptors of 32 bytes each.
+The decrypted body opens with a module directory at body `0x20`: a 32-byte
+header record, then `count - 1` named descriptors of 32 bytes and a final
+unnamed descriptor of 16 bytes.
 
 ```
 0x20            [BE32 count][BE32 dirsize][8 pad][16-byte package name]
-0x20+32*(i+1)   [BE32 offset][BE32 length][8 pad][16-byte module name]
+named record    [BE32 offset][BE32 length][8 pad][16-byte module name]
+final record    [BE32 offset][BE32 length][8 pad]
 ```
 
-Three arithmetic relations hold in every image, and are the strongest
-available check that a key is correct:
+The decrypter requires a complete directory with valid names and zero reserved
+bytes. Module lengths include their two-byte CRC and must be at least two.
+Offsets are relative to the body, all extents must be in bounds, and:
 
 - `dirsize == 48 + 32 * count`
+- the first module starts at `dirsize`
 - descriptors chain exactly, `offset + length == next offset`, from the first
 - the last descriptor ends exactly 16 bytes before end-of-body
 
 Names are NUL-padded and truncated at 16 characters, so a long one loses its
-extension (`eg1850_mas_01700`). The final descriptor is the trailing payload
-and carries no name. Names encode the version, e.g. `eg1985_018100.bi` in
-`Z_fc_0181.bin`; the Z 6II/Z 7II carry `_mas_`/`_sla_` pairs matching their
-dual-EXPEED hardware.
+extension (`eg1850_mas_01700`). The final descriptor points to an ordinary
+checksummed module and carries no name. Names encode the version, e.g.
+`eg1985_018100.bi` in `Z_fc_0181.bin`; the Z 6II/Z 7II carry `_mas_`/`_sla_` pairs matching their
+dual-EXPEED hardware. Some package/component names retain older versions, so
+filename version matching is advisory.
+
+Each module ends in a big-endian CRC16 of all preceding bytes in that module.
+The body ends in a 16-byte trailer: a big-endian CRC16 of the body excluding
+that trailer, followed by 14 zero bytes. This package CRC covers the space
+label, directory and all modules, including their CRCs. Both levels use
+polynomial `0x1021`, initial value zero, no reflection and no final XOR
+(`binascii.crc_hqx(data, 0)`).
 
 ## Exit codes
 
@@ -126,24 +138,45 @@ dual-EXPEED hardware.
 coverage, failed validation).
 
 `decrypt_firmware.py` — 0 ok, 2 usage or unreadable input, 3 bad key file,
-4 wrong scheme, 5 failed sanity check. Nothing is written unless the checks
-pass.
+4 wrong scheme, 5 invalid structure or checksums. Nothing is written unless
+the checks pass.
 
 ## Verification
 
-The built-in crib and zero-fraction checks are weak: a key with a single
-flipped bit in `T1[0]` still passes them. They catch gross failures, not
-subtle ones. To actually verify a key, use the directory arithmetic above, or
-check that a module shared between two images (e.g. the 0xe002-byte `eg*`
-module in Z 6/Z 7 vs Z 6II/Z 7II, at different body offsets) decrypts
-byte-identically — a single wrong bit breaks that.
+`decrypt_firmware.py` verifies directory structure, every module CRC, the
+package CRC and trailer padding before creating or overwriting output. It
+reports the first failure and exits 5. Zero-byte percentage is informational;
+printable strings and filename versions are not integrity checks.
 
-Both scripts carry the known-good table hashes and warn on any drift:
+An independent audit of the nine supplied images found 36/36 matching module
+CRCs and 9/9 matching package CRCs. With a deliberately wrong key containing
+`T1[0] ^= 1`, none matched, although directory arithmetic, strings and byte
+statistics still looked plausible. A localized error (`T3[136] ^= 0x37`)
+left 24 module CRCs intact but failed all nine package CRCs. The decrypter now
+rejects these controls. CRC16 detects corruption; it is not a vendor signature
+and does not establish authenticity.
+
+The extractor still uses crib/zero-fraction heuristics before writing a key;
+check recovered keys by decrypting images with the stricter decrypter.
+`extract_key.py` also reports known table SHA-256 prefixes and warns on drift:
 
 ```
 T1 29d2e34239fc33bf0a1054fd3558536a
 T2 6e87de5da7e42df91db31fae4a899a04
 T3 3617957facf8b21a5a3de0f3a1f6f27c
 ```
+
+These regression constants are not the decrypter's correctness criterion.
+Loading a key checks its recorded SHA-256 values for file consistency; the
+image-supplied CRCs validate the decoded content.
+
+Run the regression tests with:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+Tests use small synthetic containers with an independent bitwise CRC
+implementation; no firmware images or derived keys are needed.
 
 Requires Python 3 and numpy.
