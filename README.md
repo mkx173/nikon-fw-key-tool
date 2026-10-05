@@ -3,11 +3,15 @@
 Recovers the keystream tables used by Nikon's legacy firmware packaging and
 decrypts images with them. Two steps: derive the key once, then use it.
 
-Applies to **Z 5, Z 6, Z 6II, Z 7, Z 7II, Z 8, Z 30, Z 50, Z fc**.
+Applies to **Z 5, Z 6, Z 6II, Z 7, Z 7II, Z 8, Z 9, Z 30, Z 50, Z fc**.
 
-Does **not** apply to Z 5II, Z 50II, Z 6III or ZR — those use a different,
-unbroken scheme. `decrypt_firmware.py` detects them and refuses rather than
-emitting garbage.
+Does **not** apply to Z f, Z 5II, Z 50II, Z 6III or ZR — those use a
+different, unbroken scheme. `decrypt_firmware.py` detects them and refuses
+rather than emitting garbage.
+
+Note that the split is **not** by EXPEED generation. The Z 8 and Z 9 are
+EXPEED 7 and use this legacy packaging, while the Z f is contemporary with the
+Z 8 and already uses the newer scheme. Check the discriminator, not the body.
 
 ## Notice
 
@@ -27,7 +31,7 @@ bytes are a plaintext header, and body bytes `0x00`–`0x1F` are a plaintext
 32-space label; both pass through untouched. The keystream index still counts
 the label, so the first XORed byte (body `0x20`) uses `i = 0x20`. Keystream period is 2^24
 (16 MB). T1, T2 and T3 are 256 bytes each and are **generation-wide
-constants** — identical across all nine bodies — so the whole key is 768
+constants** — identical across all ten bodies — so the whole key is 768
 bytes. It is the same construction as the much older `Xor_Ord1/2/3` scheme in
 nikon-firmware-tools, with different tables.
 
@@ -50,13 +54,16 @@ Four. Every one of the 256 T3 blocks needs at least one image with
 constant-fill padding at that keystream offset, and no three images span all
 256. The tool checks coverage directly and names the missing blocks if short,
 so any sufficient set works — but exactly one of the 126 four-subsets of the
-nine known images is sufficient:
+first nine known images is sufficient:
 
 ```
 Z_8_0311.bin  Z7_2_0170.bin  Z_6_0380.bin  Z_50_0260.bin
 ```
 
-Four images and all nine produce byte-identical tables.
+Four images and all nine produce byte-identical tables. The Z 9 was added
+afterwards and needs no re-derivation: the existing tables decrypt it with
+every checksum passing (below), which is itself a check that the tables are
+generation-wide.
 
 ## How it works
 
@@ -131,8 +138,11 @@ Names are NUL-padded and truncated at 16 characters, so a long one loses its
 extension (`eg1850_mas_01700`). The final descriptor points to an ordinary
 checksummed module and carries no name. Names encode the version, e.g.
 `eg1985_018100.bi` in `Z_fc_0181.bin`; the Z 6II/Z 7II carry `_mas_`/`_sla_` pairs matching their
-dual-EXPEED hardware. Some package/component names retain older versions, so
-filename version matching is advisory.
+dual-EXPEED hardware. The four-digit field is a model id, not a version —
+`1985` is the Z fc, `1990` the Z 9, `2070` the Z 8 — so `Z_9_0532.bin` holds
+`eg1990_053200.bi`, `vr1990_010200.bi` and `li1990_053200.bi`. Some
+package/component names retain older versions, so filename version matching is
+advisory.
 
 Each module ends in a big-endian CRC16 of all preceding bytes in that module.
 The body ends in a 16-byte trailer: a big-endian CRC16 of the body excluding
@@ -157,9 +167,11 @@ scripts verify directory structure, every module CRC, the package CRC and
 trailer padding: `decrypt_firmware.py` before writing output (exit 5 on the
 first failure), `extract_key.py` for every image before writing a key.
 
-The nine supplied images give 36/36 module CRCs and 9/9 package CRCs. Wrong
-keys fail: a random key, 8 flipped T2 bytes, or `T1[0] ^= 1` match none, and
-a single bad T3 entry (`T3[136] ^= 0x37`) fails all nine package CRCs. CRC16
+The nine images the key was derived from give 36/36 module CRCs and 9/9
+package CRCs. `Z_9_0532.bin`, decrypted with those same tables, adds 6/6
+module CRCs and its package CRC, for 42/42 and 10/10 overall. Wrong keys
+fail: a random key, 8 flipped T2 bytes, or `T1[0] ^= 1` match none, and a
+single bad T3 entry (`T3[136] ^= 0x37`) fails all nine package CRCs. CRC16
 detects corruption; it is not a vendor signature and does not establish
 authenticity.
 
