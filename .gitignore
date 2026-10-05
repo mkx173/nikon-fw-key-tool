@@ -1,0 +1,5 @@
+# never commit firmware, decrypted output, or derived keys
+*.bin
+*.dec
+*.json
+__pycache__/
