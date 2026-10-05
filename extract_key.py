@@ -29,7 +29,7 @@ Recovery, in five stages plus validation:
 
  3. Ground truth for T2 ^ T3. XOR every sector by T1; whatever becomes
     constant-valued is padding, giving an observation (a, b) -> T2[a] ^ T3[b].
-    Pooled across all nine images, majority vote per cell.
+    Pooled across the supplied images, majority vote per cell.
 
  4. T2 and T3 by bipartite majority propagation over those observations.
 
@@ -61,7 +61,6 @@ SEC = 256           # sector size == T1 period
 TABLE = 0x20        # module directory offset within the body
 NAME_RE = re.compile(rb"[0-9A-Za-z_][0-9A-Za-z_.]{2,15}\Z")
 
-# The nine images needed for a complete T3. Fewer leaves holes in T3.
 # A sufficient set is decided by coverage, not by a fixed file list: every one
 # of the 256 T3 blocks needs at least one image carrying constant-fill padding
 # at that keystream offset. Four images can do it -- exactly one of the 126
@@ -306,8 +305,9 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__.split("\n")[1],
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Needs all nine legacy-scheme images; fewer leaves holes in T3.")
-    ap.add_argument("firmware_dir", help="directory of encrypted .bin images")
+        epilog=("Any set covering all 256 T3 blocks works; four images can suffice.\n"
+                "Known-sufficient set: " + ", ".join(MINIMAL)))
+    ap.add_argument("firmware_dir", help="directory of encrypted .bin images with complete T3 padding coverage")
     ap.add_argument("out_key", help="JSON key file to write")
     args = ap.parse_args()
 
