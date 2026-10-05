@@ -9,6 +9,12 @@ Does **not** apply to Z 5II, Z 50II, Z 6III or ZR — those use a different,
 unbroken scheme. `decrypt_firmware.py` detects them and refuses rather than
 emitting garbage.
 
+## Notice
+
+These scripts are original work. They contain no Nikon code and no key
+material: the tables are recovered at runtime from firmware images the user
+supplies. Nikon firmware images are not redistributed here.
+
 ## The scheme
 
 ```
