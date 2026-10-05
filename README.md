@@ -12,11 +12,14 @@ emitting garbage.
 ## The scheme
 
 ```
-plain[i] = cipher[0x20 + i] ^ T1[i & 0xFF] ^ T2[(i>>8) & 0xFF] ^ T3[(i>>16) & 0xFF]
+plain[0x00:0x40] = cipher[0x00:0x40]                                   # header + space label
+plain[0x20 + i]  = cipher[0x20 + i] ^ T1[i & 0xFF] ^ T2[(i>>8) & 0xFF] ^ T3[(i>>16) & 0xFF]   # i >= 0x20
 ```
 
-`i` is the offset into the body (file offset minus `0x20`); the first `0x20`
-bytes are a header and pass through untouched. Keystream period is 2^24
+`i` is the offset into the body (file offset minus `0x20`). The first `0x20`
+bytes are a plaintext header, and body bytes `0x00`–`0x1F` are a plaintext
+32-space label; both pass through untouched. The keystream index still counts
+the label, so the first XORed byte (body `0x20`) uses `i = 0x20`. Keystream period is 2^24
 (16 MB). T1, T2 and T3 are 256 bytes each and are **generation-wide
 constants** — identical across all nine bodies — so the whole key is 768
 bytes. It is the same construction as the much older `Xor_Ord1/2/3` scheme in
@@ -64,8 +67,8 @@ Four images and all nine produce byte-identical tables.
    majority.
 4. **T2 and T3** by bipartite majority propagation, gauge `T2[0] = 0`.
 5. **Per-block re-derivation of T3** (see below).
-6. **Validation.** Six strings must survive in every image and the zero-byte
-   fraction must exceed 20%, or no key file is written.
+6. **Validation.** Every image must pass the decrypter's directory and CRC
+   checks (see [Verification](#verification)), or no key file is written.
 
 ### Why stage 5 does not score printable text
 
@@ -143,21 +146,17 @@ the checks pass.
 
 ## Verification
 
-`decrypt_firmware.py` verifies directory structure, every module CRC, the
-package CRC and trailer padding before creating or overwriting output. It
-reports the first failure and exits 5. Zero-byte percentage is informational;
-printable strings and filename versions are not integrity checks.
+Correctness is judged by the CRC16s the images carry, nothing else. Both
+scripts verify directory structure, every module CRC, the package CRC and
+trailer padding: `decrypt_firmware.py` before writing output (exit 5 on the
+first failure), `extract_key.py` for every image before writing a key.
 
-An independent audit of the nine supplied images found 36/36 matching module
-CRCs and 9/9 matching package CRCs. With a deliberately wrong key containing
-`T1[0] ^= 1`, none matched, although directory arithmetic, strings and byte
-statistics still looked plausible. A localized error (`T3[136] ^= 0x37`)
-left 24 module CRCs intact but failed all nine package CRCs. The decrypter now
-rejects these controls. CRC16 detects corruption; it is not a vendor signature
-and does not establish authenticity.
+The nine supplied images give 36/36 module CRCs and 9/9 package CRCs. Wrong
+keys fail: a random key, 8 flipped T2 bytes, or `T1[0] ^= 1` match none, and
+a single bad T3 entry (`T3[136] ^= 0x37`) fails all nine package CRCs. CRC16
+detects corruption; it is not a vendor signature and does not establish
+authenticity.
 
-The extractor still uses crib/zero-fraction heuristics before writing a key;
-check recovered keys by decrypting images with the stricter decrypter.
 `extract_key.py` also reports known table SHA-256 prefixes and warns on drift:
 
 ```
@@ -166,9 +165,8 @@ T2 6e87de5da7e42df91db31fae4a899a04
 T3 3617957facf8b21a5a3de0f3a1f6f27c
 ```
 
-These regression constants are not the decrypter's correctness criterion.
-Loading a key checks its recorded SHA-256 values for file consistency; the
-image-supplied CRCs validate the decoded content.
+These regression constants are not a correctness criterion. Loading a key
+checks its recorded SHA-256 values for file consistency only.
 
 Run the regression tests with:
 

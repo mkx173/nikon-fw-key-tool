@@ -5,16 +5,18 @@ Recover the generation-wide Nikon "legacy scheme" keystream tables.
     python3 extract_key.py firmware/expeed6 tables/key.json
 
 The legacy scheme (Z 5, Z 6, Z 6II, Z 7, Z 7II, Z 8, Z 30, Z 50, Z fc) is a
-three-table XOR keystream over the file body, which starts at offset 0x20:
+three-table XOR keystream over the file body, which starts at offset 0x20.
+Body bytes 0x00-0x1F are a plaintext 32-space label; the keystream index still
+counts them, so XOR starts at i = 0x20:
 
-    plain[i] = cipher[0x20 + i] ^ T1[i & 0xFF] ^ T2[(i>>8) & 0xFF] ^ T3[(i>>16) & 0xFF]
+    plain[0x20 + i] = cipher[0x20 + i] ^ T1[i & 0xFF] ^ T2[(i>>8) & 0xFF] ^ T3[(i>>16) & 0xFF]
 
 T1/T2/T3 are 256 bytes each and identical across all nine bodies, so the
 keystream period is 2^24 (16 MB). A "sector" is 256 body bytes; sector index
 j = i // 256 selects a = j & 0xFF in T2 and b = (j >> 8) & 0xFF in T3, so one
 whole sector shares the single constant T2[a] ^ T3[b].
 
-Recovery, in five stages:
+Recovery, in five stages plus validation:
 
  1. T1 up to a global constant. Each image holds thousands of constant-filled
     plaintext sectors, whose ciphertexts are the family {T1 ^ c}. Normalising
@@ -31,11 +33,11 @@ Recovery, in five stages:
 
  4. T2 and T3 by bipartite majority propagation over those observations.
 
- 5. A 0x00/0xFF correction pass. Padding is ambiguous between zero-fill and
-    ff-fill, so whole b-classes can come out complemented. Padding is
-    non-printable under *both* choices, so only genuine text breaks the tie:
-    score each T3[b] against T3[b] ^ 0xFF by counting varied printable windows
-    in the decrypted b-class. About 17 classes need the flip.
+ 5. Per-block re-derivation of T3. Padding is ambiguous between zero-fill
+    and ff-fill, so blocks can come out complemented; see correct_t3.
+
+ 6. Validation. Every image must pass decrypt_firmware's directory and CRC16
+    checks, or no key file is written.
 
 Requires numpy.
 """
@@ -51,6 +53,8 @@ import struct
 import sys
 
 import numpy as np
+
+import decrypt_firmware as fw
 
 HDR = 0x20          # bytes of plaintext header before the body
 SEC = 256           # sector size == T1 period
@@ -83,26 +87,6 @@ EXPECTED_SHA = {
     "T2": "6e87de5da7e42df91db31fae4a899a04",
     "T3": "3617957facf8b21a5a3de0f3a1f6f27c",
 }
-
-# Cribs that must survive decryption in every image. The missing "m" in
-# "[commnad]" is a genuine typo in Nikon's firmware -- do not fix it.
-CRIBS = [
-    b"Copyright Nikon Corp.",
-    b"memdump [MemAddr]",
-    b"stackdump [StackBaseAddr]",
-    b"command list:",
-    b"logoutputchg",
-    b"[commnad] [param1]",
-]
-
-MIN_ZERO_FRACTION = 0.20
-
-# Correction-pass tuning: a 12-byte window counts as text when every byte is
-# printable and at least 7 of its 11 adjacent pairs differ.
-WIN = 12
-MIN_VARIED = 7
-FLIP_RATIO = 1.25
-FLIP_MARGIN = 50
 
 
 # --------------------------------------------------------------------------
@@ -263,22 +247,6 @@ def solve_tables(obs):
 # stage 5: the 0x00 / 0xFF correction pass
 
 
-def text_windows(plain):
-    """Count all-printable, varied WIN-byte windows inside each row of plain."""
-    rows = plain.shape[0]
-    zero = np.zeros((rows, 1), dtype=np.int32)
-
-    printable = (plain >= 0x20) & (plain <= 0x7E)
-    cp = np.concatenate([zero, np.cumsum(printable, axis=1, dtype=np.int32)], axis=1)
-    all_printable = (cp[:, WIN:] - cp[:, :-WIN]) == WIN
-
-    differs = plain[:, 1:] != plain[:, :-1]
-    cd = np.concatenate([zero, np.cumsum(differs, axis=1, dtype=np.int32)], axis=1)
-    varied = (cd[:, WIN - 1:] - cd[:, :-(WIN - 1)]) >= MIN_VARIED
-
-    return int((all_printable & varied).sum())
-
-
 def correct_t3(images, t1, t2, t3):
     """Re-derive each T3[b] directly from the data.
 
@@ -318,29 +286,19 @@ def correct_t3(images, t1, t2, t3):
 # validation and output
 
 
-def decrypt(sectors, t1, t2, t3):
-    j = np.arange(sectors.shape[0])
-    return (sectors ^ t1 ^ (t2[j & 0xFF] ^ t3[(j >> 8) & 0xFF])[:, None])
-
-
-def validate(images, t1, t2, t3):
-    """Every image must show all cribs and be mostly zero padding."""
+def validate(dirname, images, t1, t2, t3):
+    """Every image must pass the decrypter's directory and CRC16 checks."""
     ok = True
-    for name, _, sectors in images:
-        plain = decrypt(sectors, t1, t2, t3)
-        zero = float((plain == 0).mean())
-        blob = plain.tobytes()
-        missing = [c.decode("latin1") for c in CRIBS if c not in blob]
-        mods = parse_table(blob[:TABLE + 32 * 64])
-        status = "ok"
-        if missing:
-            status = "MISSING " + ", ".join(repr(m) for m in missing)
+    for name, _, _ in images:
+        raw = open(os.path.join(dirname, name), "rb").read()
+        plain = fw.decrypt(raw, t1, t2, t3)
+        try:
+            mods = fw.validate_firmware(memoryview(plain)[HDR:])
+            status = "ok, %d module CRCs + package CRC" % len(mods)
+        except ValueError as exc:
+            status = "FAILED: %s" % exc
             ok = False
-        elif zero < MIN_ZERO_FRACTION:
-            status = "zero fraction too low"
-            ok = False
-        print("  %-16s zero=%5.1f%%  modules=%2d  cribs=%d/%d  %s"
-              % (name, 100 * zero, len(mods), len(CRIBS) - len(missing), len(CRIBS), status))
+        print("  %-16s %s" % (name, status))
     return ok
 
 
@@ -417,7 +375,7 @@ def main():
     print("    %d of 256 entries corrected" % len(flipped))
 
     print("\nvalidation")
-    if not validate(images, t1, t2, t3):
+    if not validate(args.firmware_dir, images, t1, t2, t3):
         sys.exit("error: validation failed -- no key file written")
 
     tables = {"T1": t1.tobytes(), "T2": t2.tobytes(), "T3": t3.tobytes()}
@@ -434,8 +392,9 @@ def main():
         print("  WARNING: tables differ from the known-good regression values.")
 
     key = {
-        "scheme": "plain[i] = cipher[0x20 + i] ^ T1[i&0xFF] ^ T2[(i>>8)&0xFF] "
-                  "^ T3[(i>>16)&0xFF]",
+        "scheme": "plain[0x20 + i] = cipher[0x20 + i] ^ T1[i&0xFF] ^ T2[(i>>8)&0xFF] "
+                  "^ T3[(i>>16)&0xFF] for i >= 0x20; header and space label "
+                  "(file 0x00-0x3F) are plaintext",
         "body_offset": HDR,
         "period_bytes": 1 << 24,
         "T1": tables["T1"].hex(),

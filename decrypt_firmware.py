@@ -4,10 +4,11 @@ Decrypt a Nikon "legacy scheme" firmware image with a recovered key file.
 
     python3 decrypt_firmware.py tables/key.json Z_fc_0181.bin Z_fc_0181.dec
 
-The file keeps a 32-byte plaintext header; everything after it is XORed with a
-three-table keystream of period 2^24 (16 MB):
+The file keeps a 32-byte plaintext header and a plaintext 32-space label;
+everything after them is XORed with a three-table keystream of period 2^24
+(16 MB). i is the body offset (file offset - 0x20) and still counts the label:
 
-    plain[i] = cipher[0x20 + i] ^ T1[i & 0xFF] ^ T2[(i>>8) & 0xFF] ^ T3[(i>>16) & 0xFF]
+    plain[0x20 + i] = cipher[0x20 + i] ^ T1[i & 0xFF] ^ T2[(i>>8) & 0xFF] ^ T3[(i>>16) & 0xFF]   (i >= 0x20)
 
 T1/T2/T3 are generation-wide constants shared by the Z 5, Z 6, Z 6II, Z 7,
 Z 7II, Z 8, Z 30, Z 50 and Z fc; extract_key.py recovers them into the JSON
