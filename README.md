@@ -95,15 +95,30 @@ prologues; `9f070071 01190054 e0031f2a` — cmp / b.ne / mov wzr).
 
 ## Output format
 
-The decrypted body opens with a 32-byte header, then a module directory of
-32-byte entries:
+File layout is `[0x20 header][0x20 ASCII-space label][encrypted payload]`.
+The space label is literal plaintext in the container, so it is passed through
+rather than XORed.
+
+The decrypted body opens with a module directory at body `0x20`: a header
+record, then `count` descriptors of 32 bytes each.
 
 ```
-[BE32 offset][BE32 length][8 bytes padding][16-byte NUL-padded ASCII name]
+0x20            [BE32 count][BE32 dirsize][8 pad][16-byte package name]
+0x20+32*(i+1)   [BE32 offset][BE32 length][8 pad][16-byte module name]
 ```
 
-Entries chain `offset + length == next offset` from the second entry onward.
-Names encode the version, e.g. `eg1985_018100.bi` in `Z_fc_0181.bin`.
+Three arithmetic relations hold in every image, and are the strongest
+available check that a key is correct:
+
+- `dirsize == 48 + 32 * count`
+- descriptors chain exactly, `offset + length == next offset`, from the first
+- the last descriptor ends exactly 16 bytes before end-of-body
+
+Names are NUL-padded and truncated at 16 characters, so a long one loses its
+extension (`eg1850_mas_01700`). The final descriptor is the trailing payload
+and carries no name. Names encode the version, e.g. `eg1985_018100.bi` in
+`Z_fc_0181.bin`; the Z 6II/Z 7II carry `_mas_`/`_sla_` pairs matching their
+dual-EXPEED hardware.
 
 ## Exit codes
 
@@ -115,6 +130,13 @@ coverage, failed validation).
 pass.
 
 ## Verification
+
+The built-in crib and zero-fraction checks are weak: a key with a single
+flipped bit in `T1[0]` still passes them. They catch gross failures, not
+subtle ones. To actually verify a key, use the directory arithmetic above, or
+check that a module shared between two images (e.g. the 0xe002-byte `eg*`
+module in Z 6/Z 7 vs Z 6II/Z 7II, at different body offsets) decrypts
+byte-identically — a single wrong bit breaks that.
 
 Both scripts carry the known-good table hashes and warn on any drift:
 

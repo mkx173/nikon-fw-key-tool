@@ -55,7 +55,7 @@ import numpy as np
 HDR = 0x20          # bytes of plaintext header before the body
 SEC = 256           # sector size == T1 period
 TABLE = 0x20        # module directory offset within the body
-NAME_RE = re.compile(rb"[0-9A-Za-z_][0-9A-Za-z_.]*\.(?:bi|bin)\Z")
+NAME_RE = re.compile(rb"[0-9A-Za-z_][0-9A-Za-z_.]{2,15}\Z")
 
 # The nine images needed for a complete T3. Fewer leaves holes in T3.
 # A sufficient set is decided by coverage, not by a fixed file list: every one
@@ -153,18 +153,34 @@ def recover_family(sectors):
 
 
 def parse_table(plain_body, limit=64):
-    """Read the module directory; stops at the first entry that does not parse."""
+    """Read the module directory.
+
+    At body+0x20 sits a header record, then `count` 32-byte descriptors:
+
+        0x20          [BE32 count][BE32 dirsize][8 pad][16-byte package name]
+        0x20+32*(i+1) [BE32 offset][BE32 length][8 pad][16-byte module name]
+
+    dirsize == 48 + 32 * count. Descriptors chain exactly
+    (offset + length == next offset) from the first one and close 16 bytes
+    before end-of-body. Names are NUL-padded and truncated at 16 characters,
+    so a long one loses its extension ("eg1850_mas_01700"); do not require
+    one. The final descriptor is the trailing payload and carries no name.
+    """
     mods = []
-    for off in range(TABLE, TABLE + 32 * limit, 32):
+    if len(plain_body) < 0x40:
+        return mods
+    count, dirsize = struct.unpack_from(">II", plain_body, 0x20)
+    if not 0 < count <= limit or dirsize != 48 + 32 * count:
+        return mods
+    for i in range(1, count + 1):
+        off = 0x20 + i * 32
         if off + 32 > len(plain_body):
             break
         start, length = struct.unpack_from(">II", plain_body, off)
-        name = plain_body[off + 16:off + 32].rstrip(b"\0")
-        if not name or not NAME_RE.match(name):
-            break
-        mods.append((name.decode(), start, length))
+        raw = plain_body[off + 16:off + 32].rstrip(b"\0")
+        name = raw.decode() if NAME_RE.match(raw) else "(trailer)"
+        mods.append((name, start, length))
     return mods
-
 
 def chain_score(mods):
     """How many consecutive entries satisfy off + len == next off."""
@@ -179,7 +195,7 @@ def fix_constant(sectors, norm):
         t1 = bytes(b ^ g for b in norm)
         plain = bytes(b ^ t1[i % SEC] for i, b in enumerate(head))
         mods = parse_table(plain)
-        here = (len(mods), chain_score(mods[1:]))
+        here = (len(mods), chain_score(mods))
         if here > rank:
             best, table, rank = t1, mods, here
     if rank[0] < 2:
@@ -368,7 +384,7 @@ def main():
     if t1 is None:
         sys.exit("error: no global constant makes the module table parse")
     print("  fixed from %s: %d entries, %d chained"
-          % (images[0][0], len(table), chain_score(table[1:])))
+          % (images[0][0], len(table), chain_score(table)))
     for name, off, length in table[:4]:
         print("    %-18s off=0x%08x len=0x%08x" % (name, off, length))
 

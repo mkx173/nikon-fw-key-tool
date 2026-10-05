@@ -37,7 +37,7 @@ HDR = 0x20          # bytes of plaintext header before the body
 SEC = 256           # sector size == T1 period
 TABLE = 0x20        # module directory offset within the body
 NEW_SCHEME = 0x260  # where the newer, unbroken bodies put their 32 spaces
-NAME_RE = re.compile(rb"[0-9A-Za-z_][0-9A-Za-z_.]*\.(?:bi|bin)\Z")
+NAME_RE = re.compile(rb"[0-9A-Za-z_][0-9A-Za-z_.]{2,15}\Z")
 MIN_ZERO_FRACTION = 0.20
 
 EX_USAGE = 2        # bad arguments or unreadable input
@@ -101,22 +101,41 @@ def decrypt(raw, t1, t2, t3):
     sectors = np.frombuffer(body + b"\0" * pad, dtype=np.uint8).reshape(-1, SEC)
     j = np.arange(sectors.shape[0])
     plain = (sectors ^ t1 ^ (t2[j & 0xFF] ^ t3[(j >> 8) & 0xFF])[:, None])
-    return raw[:HDR] + plain.tobytes()[:len(body)]
+    out = plain.tobytes()[:len(body)]
+    # body[0x00:0x20] is a literal 32-space label in the container, not
+    # ciphertext; XORing it would emit 32 bytes of junk. Pass it through.
+    return raw[:HDR] + raw[HDR:HDR + 32] + out[32:]
 
 
-def parse_table(plain, limit=64):
-    """Read the module directory; stops at the first entry that does not parse."""
+def parse_table(plain_body, limit=64):
+    """Read the module directory.
+
+    At body+0x20 sits a header record, then `count` 32-byte descriptors:
+
+        0x20          [BE32 count][BE32 dirsize][8 pad][16-byte package name]
+        0x20+32*(i+1) [BE32 offset][BE32 length][8 pad][16-byte module name]
+
+    dirsize == 48 + 32 * count. Descriptors chain exactly
+    (offset + length == next offset) from the first one and close 16 bytes
+    before end-of-body. Names are NUL-padded and truncated at 16 characters,
+    so a long one loses its extension ("eg1850_mas_01700"); do not require
+    one. The final descriptor is the trailing payload and carries no name.
+    """
     mods = []
-    for off in range(HDR + TABLE, HDR + TABLE + 32 * limit, 32):
-        if off + 32 > len(plain):
+    if len(plain_body) < 0x40:
+        return mods
+    count, dirsize = struct.unpack_from(">II", plain_body, 0x20)
+    if not 0 < count <= limit or dirsize != 48 + 32 * count:
+        return mods
+    for i in range(1, count + 1):
+        off = 0x20 + i * 32
+        if off + 32 > len(plain_body):
             break
-        start, length = struct.unpack_from(">II", plain, off)
-        name = plain[off + 16:off + 32].rstrip(b"\0")
-        if not name or not NAME_RE.match(name):
-            break
-        mods.append((name.decode(), start, length))
+        start, length = struct.unpack_from(">II", plain_body, off)
+        raw = plain_body[off + 16:off + 32].rstrip(b"\0")
+        name = raw.decode() if NAME_RE.match(raw) else "(trailer)"
+        mods.append((name, start, length))
     return mods
-
 
 def main():
     ap = argparse.ArgumentParser(
@@ -138,7 +157,7 @@ def main():
     check_scheme(raw, args.firmware)
 
     plain = decrypt(raw, t1, t2, t3)
-    mods = parse_table(plain)
+    mods = parse_table(plain[HDR:])
     zero = plain.count(0) / len(plain)
 
     print("module table:")
