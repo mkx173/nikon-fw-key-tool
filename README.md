@@ -81,14 +81,24 @@ included (see [Verification](#verification)).
 ## Usage
 
 ```sh
-python3 extract_key.py <firmware_dir> <key.json>
-python3 decrypt_firmware.py <key.json> <firmware.bin> <out.dec>
+python3 extract_key.py --firmware-dir <dir> --out <key.json>
+python3 decrypt_firmware.py --key <key.json> --firmware <fw.bin> --out <out.dec>
 
 # Z 8 / Z 9 only: recover the signature key, then repack with a valid header
-python3 solve_signature_e7.py <key.json> <stock.bin> [...] -o <sig.json>
-python3 repack_firmware.py <key.json> <sig.json> <in.bin> <out.bin> \
+python3 solve_signature_e7.py --key <key.json> --firmware <stock.bin> [...] \
+    --out <sig.json>
+python3 repack_firmware.py --key <key.json> --sig <sig.json> \
+    --firmware <in.bin> --out <out.bin> \
     --patch <module>:<offset>:<hexbytes>
 ```
+
+**Every parameter is named.** There are no positional arguments anywhere, so no
+ordering slip can put an input path where the output goes — the failure that
+would otherwise overwrite an irreplaceable vendor image with a decrypted body.
+A missing flag is a usage error naming the flag, not a file written to the wrong
+place. For the same reason an `--out` that already exists is refused unless
+`--force` is given, and `repack_firmware.py` additionally refuses an `--out`
+that resolves to the same file as its `--firmware`.
 
 No key material ships in this repo. `extract_key.py` derives the tables and
 `solve_signature_e7.py` the signature key, both from firmware images you supply;
@@ -221,7 +231,8 @@ coverage, failed validation).
 
 `decrypt_firmware.py` — 0 ok, 2 usage or unreadable input, 3 bad key file,
 4 wrong scheme, 5 invalid structure or checksums. Nothing is written unless
-the checks pass.
+the checks pass. Exit 2 includes a missing flag and an `--out` that already
+exists without `--force`, which is checked before any work is done.
 
 `solve_signature_e7.py` — as above, plus 6 no keystream reproduced the header
 digest, 9 not an EXPEED 7 body, 10 two images of one camera disagreed on K8,

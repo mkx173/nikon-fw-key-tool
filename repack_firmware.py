@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Repack a legacy-scheme Nikon image, recomputing both CRCs and the header SHA-1.
 
-    python3 repack_firmware.py key.json sig.json Z_8_0311.bin Z_8_0312.bin \
+    python3 repack_firmware.py --key key.json --sig sig.json \
+        --firmware Z_8_0311.bin --out Z_8_0312.bin \
         --patch vr2070:0x1000:deadbeef
+
+Every parameter is named: there are no positional arguments, so no ordering
+mistake can put the stock image where the output goes. An existing --out is
+refused unless --force, and --out may not be the same file as --firmware.
 
 Editing a decrypted body invalidates three things, and all three are fixed here:
 
@@ -165,10 +170,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Exit codes: 2 usage, 3 bad key, 4 wrong scheme, 5 invalid structure, "
                "7 bad patch, 8 output failed verification.")
-    ap.add_argument("key", help="key JSON from extract_key.py")
-    ap.add_argument("sig", help="signature key JSON from solve_signature_e7.py")
-    ap.add_argument("firmware", help="stock encrypted .bin to start from")
-    ap.add_argument("out", help="repacked encrypted .bin to write")
+    ap.add_argument("--key", required=True, help="key JSON from extract_key.py")
+    ap.add_argument("--sig", required=True,
+                    help="signature key JSON from solve_signature_e7.py")
+    ap.add_argument("--firmware", required=True,
+                    help="stock encrypted .bin to start from")
+    ap.add_argument("--out", required=True, help="repacked encrypted .bin to write")
+    ap.add_argument("--force", action="store_true",
+                    help="replace --out if it already exists")
     ap.add_argument("--patch", action="append", default=[], metavar="MODULE:OFF:HEX",
                     help="patch bytes in a module, repeatable")
     ap.add_argument("--replace", action="append", default=[], metavar="MODULE=PATH",
@@ -176,6 +185,7 @@ def main():
     ap.add_argument("--selftest", action="store_true",
                     help="repack with no edits; the output must be bit-identical to the input")
     args = ap.parse_args()
+    fw.refuse_clobber(args.out, args.force)
 
     if os.path.realpath(args.out) == os.path.realpath(args.firmware):
         fw.die(fw.EX_USAGE,

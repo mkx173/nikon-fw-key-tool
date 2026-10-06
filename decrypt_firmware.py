@@ -2,7 +2,12 @@
 """
 Decrypt a Nikon "legacy scheme" firmware image with a recovered key file.
 
-    python3 decrypt_firmware.py tables/key.json Z_fc_0181.bin Z_fc_0181.dec
+    python3 decrypt_firmware.py --key tables/key.json \
+        --firmware Z_fc_0181.bin --out Z_fc_0181.dec
+
+Every parameter is named: there are no positional arguments, so no ordering
+mistake can put an input path where the output goes. An existing --out is
+refused unless --force.
 
 The file keeps a 32-byte plaintext header and a plaintext 32-space label;
 everything after them is XORed with a three-table keystream of period 2^24
@@ -30,6 +35,7 @@ import argparse
 import binascii
 import hashlib
 import json
+import os
 import re
 import struct
 import sys
@@ -52,6 +58,13 @@ EX_SANITY = 5       # decrypted structure or checksums invalid
 def die(code, msg):
     print("error: " + msg, file=sys.stderr)
     sys.exit(code)
+
+
+def refuse_clobber(path, force):
+    """Never silently replace a file. Inputs here are large and hard to re-fetch,
+    and a mistyped --out used to be able to land on one."""
+    if path and os.path.exists(path) and not force:
+        die(EX_USAGE, "%s already exists; pass --force to replace it." % path)
 
 
 def load_key(path):
@@ -207,10 +220,13 @@ def main():
         description=__doc__.split("\n")[1],
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Exit codes: 2 usage, 3 bad key, 4 wrong scheme, 5 invalid structure/checksums.")
-    ap.add_argument("key", help="key JSON from extract_key.py")
-    ap.add_argument("firmware", help="encrypted .bin image")
-    ap.add_argument("out", help="decrypted output file")
+    ap.add_argument("--key", required=True, help="key JSON from extract_key.py")
+    ap.add_argument("--firmware", required=True, help="encrypted .bin image")
+    ap.add_argument("--out", required=True, help="decrypted output file")
+    ap.add_argument("--force", action="store_true",
+                    help="replace --out if it already exists")
     args = ap.parse_args()
+    refuse_clobber(args.out, args.force)
 
     t1, t2, t3 = load_key(args.key)
     try:

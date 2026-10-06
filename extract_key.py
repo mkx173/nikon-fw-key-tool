@@ -2,7 +2,7 @@
 """
 Recover the generation-wide Nikon "legacy scheme" keystream tables.
 
-    python3 extract_key.py firmware/expeed6 tables/key.json
+    python3 extract_key.py --firmware-dir firmware/expeed6 --out tables/key.json
 
 The legacy scheme (Z 5, Z 6, Z 6II, Z 7, Z 7II, Z 8, Z 30, Z 50, Z fc) is a
 three-table XOR keystream over the file body, which starts at offset 0x20.
@@ -307,9 +307,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=("Any set covering all 256 T3 blocks works; four images can suffice.\n"
                 "Known-sufficient set: " + ", ".join(MINIMAL)))
-    ap.add_argument("firmware_dir", help="directory of encrypted .bin images with complete T3 padding coverage")
-    ap.add_argument("out_key", help="JSON key file to write")
+    ap.add_argument("--firmware-dir", required=True, dest="firmware_dir",
+                    help="directory of encrypted .bin images with complete T3 padding coverage")
+    ap.add_argument("--out", required=True, dest="out_key", metavar="PATH",
+                    help="JSON key file to write")
+    ap.add_argument("--force", action="store_true",
+                    help="replace --out if it already exists")
     args = ap.parse_args()
+    fw.refuse_clobber(args.out_key, args.force)
 
     if not os.path.isdir(args.firmware_dir):
         sys.exit("error: %s is not a directory" % args.firmware_dir)

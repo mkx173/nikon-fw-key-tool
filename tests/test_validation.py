@@ -126,9 +126,12 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             fw.validate_firmware(body)
 
-    def run_cli(self, key, source, destination):
-        with mock.patch.object(sys, "argv", ["decrypt_firmware.py", str(key),
-                                            str(source), str(destination)]), \
+    def run_cli(self, key, source, destination, force=False):
+        argv = ["decrypt_firmware.py", "--key", str(key),
+                "--firmware", str(source), "--out", str(destination)]
+        if force:
+            argv.append("--force")
+        with mock.patch.object(sys, "argv", argv), \
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
             try:
@@ -157,7 +160,13 @@ class ValidationTests(unittest.TestCase):
             key["self_check"]["T1"] = hashlib.sha256(bad).hexdigest()
             keyfile.write_text(json.dumps(key))
             destination.write_bytes(b"existing output")
+            # An existing output is refused outright, before any work.
             code, message = self.run_cli(keyfile, source, destination)
+            self.assertEqual(code, fw.EX_USAGE)
+            self.assertIn("already exists", message)
+            self.assertEqual(destination.read_bytes(), b"existing output")
+            # And even when replacing is allowed, validation still runs first.
+            code, message = self.run_cli(keyfile, source, destination, force=True)
             self.assertEqual(code, fw.EX_SANITY)
             self.assertIn("CRC mismatch", message)
             self.assertEqual(destination.read_bytes(), b"existing output")

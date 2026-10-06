@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Recover the 8-byte signature key an EXPEED 7 legacy body appends before hashing.
 
-    python3 solve_signature_e7.py key.json Z_8_0311.bin Z_8_0300.bin -o sig.json
+    python3 solve_signature_e7.py --key key.json \
+        --firmware Z_8_0311.bin Z_8_0300.bin --out sig.json
 
 The 32-byte plaintext header is not opaque. Its first 20 bytes are a SHA-1:
 
@@ -167,11 +168,14 @@ def main():
         epilog="Exit codes: 2 usage, 3 bad key, 4 wrong scheme, 5 invalid structure, "
                "6 unsolved, 9 not an EXPEED 7 body, 10 images disagree, "
                "11 seed not found.")
-    ap.add_argument("key", help="key JSON from extract_key.py")
-    ap.add_argument("firmware", nargs="+",
+    ap.add_argument("--key", required=True, help="key JSON from extract_key.py")
+    ap.add_argument("--firmware", required=True, nargs="+",
                     help="one or more UNMODIFIED Z 8 or Z 9 images of the SAME camera")
-    ap.add_argument("-o", "--out", help="write the recovered key to this JSON file")
+    ap.add_argument("--out", help="write the recovered key to this JSON file")
+    ap.add_argument("--force", action="store_true",
+                    help="replace --out if it already exists")
     args = ap.parse_args()
+    fw.refuse_clobber(args.out, args.force)
 
     key = fw.load_key(args.key)
     cands = candidates()
