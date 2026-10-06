@@ -1,7 +1,8 @@
 # nikon-fw-key-tool
 
-Recovers the keystream tables used by Nikon's legacy firmware packaging and
-decrypts images with them. Two steps: derive the key once, then use it.
+Recovers the keys used by Nikon's legacy firmware packaging and works with the
+images: decrypt them, and — on the Z 8 and Z 9 — repack an edited image with a
+valid header signature. Derive a key once, then use it.
 
 Applies to **Z 5, Z 6, Z 6II, Z 7, Z 7II, Z 8, Z 9, Z 30, Z 50, Z fc**.
 
@@ -17,7 +18,8 @@ Z 8 and already uses the newer scheme. Check the discriminator, not the body.
 
 These scripts are original work. They contain no Nikon code and no key
 material: the tables are recovered at runtime from firmware images the user
-supplies. Nikon firmware images are not redistributed here.
+supplies, and so is the 8-byte header-signature key. Nikon firmware images are
+not redistributed here.
 
 ## The scheme
 
@@ -38,15 +40,66 @@ nikon-firmware-tools, with different tables.
 Legacy images are identified by 32 ASCII spaces at file offset `0x20`. The
 newer scheme puts them at `0x260`.
 
+## The header signature
+
+The 32-byte plaintext header is not opaque. Its first 20 bytes are a SHA-1 over
+the **decrypted** body plus 8 key bytes that appear nowhere in the image:
+
+```
+header[0:20] == SHA1( decrypt(image)[0x20:] || K8 )
+```
+
+The message is the whole decrypted body — space label, directory, every module
+and the 16-byte checksum trailer, to end of file — and the camera appends K8 in
+memory before hashing. Because the hash covers plaintext, no amount of searching
+the ciphertext finds it; because of the 8-byte suffix, no range of the plaintext
+matches either.
+
+`header[20:32]` is **not** covered by the digest and is not checked. What it
+holds is still unidentified; curiously, two unrelated images can share it
+exactly (`Z_50_0260.bin` and `Z_8_0210.bin` do), so it is not a per-build
+random value.
+
+K8 is a per-camera constant, not per-version: one value verifies every firmware
+revision of one body. It is a fixed 8-byte seed in the body XORed with a short
+keystream `k[i] = (b + a * ((i + 1) * M + i * (i + 1) // 2)) & 0xFF`, so once
+the seed is read out of the image only `(a, b, M)` vary and the search is
+exhaustive and instant.
+
+**Scope: the Z 8 and Z 9 only.** Those two EXPEED 7 bodies keep the seed in a
+literal pool, 24 bytes before the SHA-1 initialisation vector, so it can be read
+from the image you already supplied. The EXPEED 6 bodies — Z 5, Z 6, Z 6II,
+Z 7, Z 7II, Z 30, Z 50, Z fc — build it from `movz`/`movk` immediates instead,
+and most do not use this keystream family at all; `solve_signature_e7.py`
+refuses them by model id (exit 9) rather than guessing. Recovering theirs needs a
+different method and belongs in its own script.
+
+The construction was read out of the body's own firmware-manager code, and the
+repacker's `--selftest` reproduces a vendor image bit-for-bit, header digest
+included (see [Verification](#verification)).
+
 ## Usage
 
 ```sh
 python3 extract_key.py <firmware_dir> <key.json>
 python3 decrypt_firmware.py <key.json> <firmware.bin> <out.dec>
+
+# Z 8 / Z 9 only: recover the signature key, then repack with a valid header
+python3 solve_signature_e7.py <key.json> <stock.bin> [...] -o <sig.json>
+python3 repack_firmware.py <key.json> <sig.json> <in.bin> <out.bin> \
+    --patch <module>:<offset>:<hexbytes>
 ```
 
-No key material ships in this repo. `extract_key.py` derives it from firmware
-images you supply; `.gitignore` keeps images, keys and output out of git.
+No key material ships in this repo. `extract_key.py` derives the tables and
+`solve_signature_e7.py` the signature key, both from firmware images you supply;
+`.gitignore` keeps images, keys and output out of git.
+
+Pass `solve_signature_e7.py` two or more revisions of the same camera and each
+is required to agree on K8 — a single image cannot cross-check itself. The
+repacker re-reads and re-validates its own output, and refuses to leave a file
+behind that fails. Patches are length-preserving: module extents chain exactly
+and the directory stores absolute offsets, so resizing a module would mean
+rewriting every following descriptor.
 
 ## How many images do you need?
 
@@ -113,7 +166,9 @@ prologues; `9f070071 01190054 e0031f2a` — cmp / b.ne / mov wzr).
 
 File layout is `[0x20 header][0x20 ASCII-space label][encrypted payload]`.
 The space label is literal plaintext in the container, so it is passed through
-rather than XORed.
+rather than XORed. The header is plaintext too, and its first 20 bytes are the
+SHA-1 described in [The header signature](#the-header-signature); the remaining
+12 are unidentified and unchecked.
 
 The decrypted body opens with a module directory at body `0x20`: a 32-byte
 header record, then `count - 1` named descriptors of 32 bytes and a final
@@ -151,6 +206,14 @@ label, directory and all modules, including their CRCs. Both levels use
 polynomial `0x1021`, initial value zero, no reflection and no final XOR
 (`binascii.crc_hqx(data, 0)`).
 
+Note what the package CRC does **not** buy. With initial value zero and no final
+XOR, CRC16 is self-annihilating: `crc(module ‖ crc(module)) == 0`, which is
+`0x0000` for all five Z 8 modules. So once every module CRC is correct, the
+package CRC is a function of the space label, the directory and the module
+extents only — not of any module payload. Patch a byte inside a module, fix that
+module's CRC, and the package CRC is unchanged (`0xc811` before and after on
+`Z_8_0311.bin`). It catches a damaged directory, not a damaged payload.
+
 ## Exit codes
 
 `extract_key.py` — 0 ok, 1 any failure (no images, disagreeing T1, incomplete
@@ -159,6 +222,18 @@ coverage, failed validation).
 `decrypt_firmware.py` — 0 ok, 2 usage or unreadable input, 3 bad key file,
 4 wrong scheme, 5 invalid structure or checksums. Nothing is written unless
 the checks pass.
+
+`solve_signature_e7.py` — as above, plus 6 no keystream reproduced the header
+digest, 9 not an EXPEED 7 body, 10 two images of one camera disagreed on K8,
+11 the seed literal could not be located.
+
+`repack_firmware.py` — as `decrypt_firmware.py`, plus 7 a patch could not be
+applied as given, 8 its own output failed re-validation. Exit 3 also covers a
+signature key that does not verify the input, which means the wrong camera or
+an already-modified image; exit 2 covers an output path that cannot be written
+and an output that is the same file as the input. Output goes to a temporary
+name and is renamed into place, so a failure of any kind — including a full disk
+— leaves no file behind rather than a truncated image with a valid header.
 
 ## Verification
 
@@ -172,8 +247,43 @@ package CRCs. `Z_9_0532.bin`, decrypted with those same tables, adds 6/6
 module CRCs and its package CRC, for 42/42 and 10/10 overall. Wrong keys
 fail: a random key, 8 flipped T2 bytes, or `T1[0] ^= 1` match none, and a
 single bad T3 entry (`T3[136] ^= 0x37`) fails all nine package CRCs. CRC16
-detects corruption; it is not a vendor signature and does not establish
-authenticity.
+detects corruption and is not a signature of any kind.
+
+The header SHA-1 is a signature in the sense that it is checked before a flash,
+but it establishes no authenticity: the key is symmetric and sits in the image,
+so anyone who can read the body can also sign one. There is no asymmetric
+crypto in this packaging. (The newer scheme the Z f, Z 5II, Z 50II, Z 6III and
+ZR use does carry a 256-byte per-image field, which this tool does not touch.)
+
+Three checks stand behind the signature work, all reproducible without trusting
+any of the analysis above. They are listed with what each one actually proves,
+because it is easy to credit the wrong one:
+
+- **A unique search hit.** `solve_signature_e7.py` tests 131072 candidate
+  keystreams against a 160-bit target and exactly one survives, for the Z 8 and
+  for the Z 9 alike. A wrong construction does not produce a hit at all.
+- **Prediction on an image the solver never read.** Recover K8 from
+  `Z_8_0210.bin` and `Z_8_0300.bin` only, then check `Z_8_0311.bin` by hand: its
+  header follows. That is the test that rules out circularity — the key is fixed
+  before the image it predicts is opened. All three bodies are distinct, and
+  `Z_8_0210.bin` is not even the same length. Flip any single byte of K8 and the
+  prediction fails.
+- **A patched run.** The digest must change when the body changes, and the
+  repacker's stock pre-check must still reproduce the vendor header from the
+  recovered key before it will touch anything.
+
+`--selftest` is deliberately **not** on that list. With no edits the recomputed
+digest necessarily equals the stored one, so a bit-identical round trip cannot
+show that the digest was recomputed at all: a repacker that copied the vendor
+header verbatim would pass it, and so would one that skipped the package CRC
+(see the self-annihilation note above). What it does prove is that the cipher,
+the CRC pass and the container walk are faithful — worth having, but it is not
+evidence for the signature construction.
+
+An independent re-implementation sharing no code with these scripts reproduces
+the cipher, the CRC16s and the header relation: with the two further Z 8
+revisions added to the ten above, the same tables give 52/52 module CRCs and
+12/12 package CRCs.
 
 `extract_key.py` also reports known table SHA-256 prefixes and warns on drift:
 
