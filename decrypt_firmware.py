@@ -1,34 +1,15 @@
 #!/usr/bin/env python3
 """
-Decrypt a Nikon "legacy scheme" firmware image with a recovered key file.
+Decrypt and validate a legacy Nikon firmware image using recovered XOR tables.
 
-    python3 decrypt_firmware.py --key tables/key.json \
-        --firmware Z_fc_0181.bin --out Z_fc_0181.dec
+    python3 decrypt_firmware.py --key key.json \
+        --firmware Z_8_0311.bin --out Z_8_0311.dec
 
-Every parameter is named: there are no positional arguments, so no ordering
-mistake can put an input path where the output goes. An existing --out is
-refused unless --force.
+The header and space label remain plaintext. The directory, module CRCs and
+package CRC must pass validation before output is written. Existing outputs
+require --force. See README.md for supported models and the container format.
 
-The file keeps a 32-byte plaintext header and a plaintext 32-space label;
-everything after them is XORed with a three-table keystream of period 2^24
-(16 MB). i is the body offset (file offset - 0x20) and still counts the label:
-
-    plain[0x20 + i] = cipher[0x20 + i] ^ T1[i & 0xFF] ^ T2[(i>>8) & 0xFF] ^ T3[(i>>16) & 0xFF]   (i >= 0x20)
-
-T1/T2/T3 are generation-wide constants shared by the Z 5, Z 6, Z 6II, Z 7,
-Z 7II, Z 8, Z 30, Z 50 and Z fc; extract_key.py recovers them into the JSON
-key file this script consumes.
-
-Scheme discriminator: a legacy image has 32 ASCII spaces at file offset 0x20.
-The newer bodies (Z 5II, Z 50II, Z 6III, ZR) put them at 0x260 and use a
-different, unbroken scheme -- those are rejected here.
-
-Decrypted layout: a 32-byte header, space label, module directory and payloads.
-Every descriptor is 32 bytes and the name comes first, before the extent.
-Module extents must chain exactly. Each module and the complete body carry
-CRC16 checksums which are verified before any output is written.
-
-Requires numpy.
+Requires NumPy.
 """
 
 import argparse
@@ -45,7 +26,7 @@ import numpy as np
 HDR = 0x20          # bytes of plaintext header before the body
 SEC = 256           # sector size == T1 period
 TABLE = 0x20        # module directory offset within the body
-NEW_SCHEME = 0x260  # where the newer, unbroken bodies put their 32 spaces
+NEW_SCHEME = 0x260  # space-label offset in newer packaging
 NAME_RE = re.compile(rb"[0-9A-Za-z_][0-9A-Za-z_.]{2,15}\Z")
 TRAILER = 16       # BE16 body CRC followed by 14 zero bytes
 
@@ -61,14 +42,13 @@ def die(code, msg):
 
 
 def refuse_clobber(path, force):
-    """Never silently replace a file. Inputs here are large and hard to re-fetch,
-    and a mistyped --out used to be able to land on one."""
+    """Reject an existing output unless replacement is explicitly enabled."""
     if path and os.path.exists(path) and not force:
         die(EX_USAGE, "%s already exists; pass --force to replace it." % path)
 
 
 def load_key(path):
-    """Load the three tables, refusing anything that fails its own self_check."""
+    """Load three 256-byte tables and verify their recorded SHA-256 hashes."""
     try:
         with open(path) as fh:
             key = json.load(fh)
@@ -111,48 +91,26 @@ def check_scheme(raw, path):
 
 
 def decrypt(raw, t1, t2, t3):
-    """Whole body, trailing partial sector included."""
+    """Apply the XOR cipher to the body, preserving the header and space label."""
     body = raw[HDR:]
     pad = -len(body) % SEC
     sectors = np.frombuffer(body + b"\0" * pad, dtype=np.uint8).reshape(-1, SEC)
     j = np.arange(sectors.shape[0])
     plain = (sectors ^ t1 ^ (t2[j & 0xFF] ^ t3[(j >> 8) & 0xFF])[:, None])
     out = plain.tobytes()[:len(body)]
-    # body[0x00:0x20] is a literal 32-space label in the container, not
-    # ciphertext; XORing it would emit 32 bytes of junk. Pass it through.
+    # The first 32 body bytes are a plaintext space label.
     return raw[:HDR] + raw[HDR:HDR + 32] + out[32:]
 
 
 def parse_table(plain_body, limit=64):
-    """Read a complete module directory, rejecting invalid extents/names.
+    """Read the complete directory or raise ValueError.
 
-    At body+0x20 sits a 16-byte header, then `count` 32-byte descriptors in
-    which THE NAME COMES FIRST:
+    Body 0x20: [BE32 count][BE32 directory size][8 zero bytes]
+    Body 0x30: count × [16-byte name][BE32 offset][BE32 length][8 zero bytes]
 
-        0x20   [BE32 count][BE32 dirsize][8 pad]
-        0x30   `count` x [16-byte module name][BE32 offset][BE32 length][8 pad]
-
-    dirsize == 48 + 32 * count == 0x30 + 0x20 * count, which is where the
-    first module starts, so the directory closes exactly with no leftover.
-
-    This ordering is what the camera's own reader walks: on an EXPEED 7 body
-    0x4101dee0 -> 0x41016b24 copies body[0x30:dirsize], case-folds the first
-    0x10 bytes of each 0x20-byte record (the name) and byte-swaps the two BE32
-    words at record+0x10/+0x14 (offset and length).
-
-    An earlier version of this function read the extent at descriptor+0x00 and
-    the name at descriptor+0x10, treating body+0x30 as a "package name" and
-    the last descriptor as 16 bytes and unnamed. Every byte position happens to
-    coincide, so extents and CRCs were unaffected and no checksum ever caught
-    it -- but each module was reported under the PREVIOUS descriptor's name.
-    That mislabelled the main application as "vr", the Linux image as unnamed,
-    and the body micro as "_tpj01"; a --patch aimed by name hit the wrong
-    module entirely.
-
-    Names are NUL-padded and truncated at 16 characters, so a long one loses
-    its extension ("eg1850_mas_01700"); do not require one. Offsets are
-    relative to the body. Lengths include the module CRC. Raises ValueError
-    rather than returning a partial directory.
+    Names are NUL-padded or occupy all 16 bytes. Offsets are body-relative;
+    lengths include the two-byte CRC. Extents must chain from the directory
+    end (48 + 32 * count) to the final 16-byte checksum trailer.
     """
     if len(plain_body) < TABLE + 32 + 16 + TRAILER:
         raise ValueError("truncated module directory or checksum trailer")
@@ -201,12 +159,11 @@ def parse_table(plain_body, limit=64):
 
 
 def validate_firmware(plain_body):
-    """Verify structure and image-supplied CRC16s; return the module table.
+    """Validate the directory, padding and both CRC levels; return modules.
 
-    CRC16 uses polynomial 0x1021, seed 0, no final XOR; stored values are BE16.
-    The package CRC covers the entire body except its final 16-byte trailer,
-    including the space label, directory, and each module's own CRC.
-    These are integrity checks, not vendor signature/authenticity checks.
+    CRC16 uses polynomial 0x1021, initial value zero and no final XOR.
+    Stored CRCs are big-endian. The package CRC covers body[:-16], including
+    module CRCs. These checks establish integrity, not authenticity.
     """
     body = memoryview(plain_body)
     mods = parse_table(body)
@@ -262,7 +219,8 @@ def main():
     for name, off, length in mods:
         print("   %-18s off=0x%08x len=0x%08x" % (name, off, length))
 
-    # the module names carry the firmware version, e.g. eg1985_018100.bi for 1.81
+    # Warn if the filename's version appears in no module name; component
+    # versions can lag the release, so this is advisory.
     want = re.findall(r"\d+", args.firmware.rsplit("/", 1)[-1])
     want = want[-1] if want else ""
     if want and mods and not any(want in name for name, _, _ in mods):

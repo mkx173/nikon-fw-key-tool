@@ -61,8 +61,7 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(len(mods), 2)
         self.assertEqual(mods[0], ("module1.bin", 112, 1026))
         self.assertEqual(mods[1], ("module2.bin", 1138, 2042))
-        # The directory closes exactly at the first module; these are payload
-        # bytes, and under the old off-by-one they were read as a name.
+        # Payload bytes at the directory boundary must not be parsed as a name.
         self.assertEqual(self.body[112:128], b"\xff" * 16)
 
     def test_single_named_module_with_empty_payload(self):
@@ -80,8 +79,7 @@ class ValidationTests(unittest.TestCase):
 
     def test_package_crc_covers_directory(self):
         body = self.body.copy()
-        # Valid replacement name byte in descriptor 2; extents and module
-        # CRCs stay valid, so only the package CRC can catch it.
+        # A valid name edit preserves module CRCs but invalidates the package CRC.
         body[80] = ord("n")
         with self.assertRaisesRegex(ValueError, "package CRC mismatch"):
             fw.validate_firmware(body)
@@ -156,19 +154,19 @@ class ValidationTests(unittest.TestCase):
             destination = root / "output.dec"
             self.assertEqual(self.run_cli(keyfile, source, destination)[0], 0)
             self.assertEqual(destination.read_bytes(), source.read_bytes())
-            # Still internally self-consistent as a key file, but incorrect.
+            # A valid key-file hash does not guarantee correct XOR tables.
             bad = bytearray(256)
             bad[0] = 1
             key["T1"] = bad.hex()
             key["self_check"]["T1"] = hashlib.sha256(bad).hexdigest()
             keyfile.write_text(json.dumps(key))
             destination.write_bytes(b"existing output")
-            # An existing output is refused outright, before any work.
+            # Refuse existing outputs before loading or validating input.
             code, message = self.run_cli(keyfile, source, destination)
             self.assertEqual(code, fw.EX_USAGE)
             self.assertIn("already exists", message)
             self.assertEqual(destination.read_bytes(), b"existing output")
-            # And even when replacing is allowed, validation still runs first.
+            # --force permits replacement only after validation succeeds.
             code, message = self.run_cli(keyfile, source, destination, force=True)
             self.assertEqual(code, fw.EX_SANITY)
             self.assertIn("CRC mismatch", message)
@@ -179,8 +177,7 @@ class ValidationTests(unittest.TestCase):
 
 
 class DeprecatedFlagTests(unittest.TestCase):
-    """--patch/--replace must refuse, and derive their advice from the real
-    directory rather than a static prefix table."""
+    """Check deprecated-flag rejection and directory-based selector migration."""
 
     # (name, body offset, length) -- only name and offset are consulted.
     FIVE = [("ex2010_0200a0.bi", 0xd0, 0x80002),
@@ -189,8 +186,7 @@ class DeprecatedFlagTests(unittest.TestCase):
             ("vr2010_010000.bi", 0x5545273, 0xccc08),
             ("li2010_0200i1.bi", 0x5611e7b, 0x1a1f002)]
 
-    # A Z 6II/Z 7II-shaped container: two modules share the `eg` prefix, which
-    # is what breaks any static prefix mapping.
+    # Dual-EXPEED layout with a shared eg prefix tests positional migration.
     DUAL = [("ex1850_017000.bi", 0xf0, 0x80002),
             ("_tpj01_0210.bin", 0x800f2, 0xe002),
             ("eg1850_mas_0170", 0x8e0f4, 0x1000000),
@@ -213,10 +209,7 @@ class DeprecatedFlagTests(unittest.TestCase):
                 self.assertEqual(new_name, expected, note)
 
     def test_shared_prefix_is_resolved_positionally_not_by_prefix(self):
-        """The regression this derivation exists for: on a dual-EXPEED body the
-        old selector eg..._sla_... chose the extent now named eg..._mas_..., and
-        a static prefix table would have sent the user to _tpj01 instead -- a
-        valid extent, so the mis-aimed patch would have succeeded silently."""
+        """An old slave selector must resolve to the master extent, not _tpj01."""
         new_name, note = self.resolve(self.DUAL, "eg1850_sla_0170")
         self.assertEqual(new_name, "eg1850_mas_0170", note)
         self.assertNotEqual(new_name, "_tpj01_0210.bin")

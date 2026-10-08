@@ -1,52 +1,20 @@
 #!/usr/bin/env python3
-"""Repack a legacy-scheme Nikon image, recomputing both CRCs and the header SHA-1.
+"""Repack a legacy Nikon image with updated CRCs and header digest.
 
     python3 repack_firmware.py --key key.json --sig sig.json \
         --firmware Z_8_0311.bin --out Z_8_0312.bin \
-        --patch vr2070:0x1000:deadbeef
+        --patch-module eg:0x1000:deadbeef
 
-Every parameter is named: there are no positional arguments, so no ordering
-mistake can put the stock image where the output goes. An existing --out is
-refused unless --force, and --out may not be the same file as --firmware.
+Edits preserve module lengths and exclude CRC bytes. Resealing runs in order:
+module CRCs, package CRC, then SHA1(body || K8). Header bytes 20:32 are preserved.
+The input signature and rebuilt image must verify before an atomic output rename.
+Existing outputs require --force; output must differ from the input path.
 
-Editing a decrypted body invalidates three things, and all three are fixed here:
+--selftest requires a bit-identical round trip without edits. It checks the
+container round trip but alone cannot prove digest recomputation. Keep the
+vendor filename pattern so the camera recognises the package.
 
-    module CRC16    BE16 at the end of each module, over module[:-2]
-    package CRC16   BE16 at body[-16:], over body[:-16]
-    header SHA-1    header[0:20] == SHA1(body || K8)      -- see solve_signature_e7.py
-
-The signature covers the body after every CRC is settled, so the order matters:
-modules, then package, then header. header[20:32] is not covered by the digest
-and is passed through untouched.
-
-Encryption is the same XOR as decryption, so decrypt_firmware.decrypt() is its
-own inverse -- including the detail that the 32-space label at body 0x00 is
-literal and must NOT be enciphered, which a from-scratch packer gets wrong.
-
-Patches are length-preserving on purpose. Module extents chain exactly and the
-directory stores absolute body offsets, so resizing a module means rewriting
-every following descriptor; refusing that keeps this tool honest about what it
-verifies. A patch may not touch a module's own 2 CRC bytes -- those are output,
-not input.
-
-Every run re-reads its own output and re-validates it with the same code
-decrypt_firmware.py uses. The file is written to a temporary name and renamed
-into place, so a failure -- a full disk, a bad path, a failed check -- leaves no
-output behind rather than a truncated image with a plausible header.
-
-What `--selftest` does and does not prove: with no edits the recomputed digest
-necessarily equals the stored one, so a bit-identical round trip does NOT show
-the digest was recomputed at all -- a repacker that simply copied the vendor
-header would pass it. It proves the cipher, the CRC pass and the container
-walk are faithful. What proves the digest is really recomputed is a patched run
-(the digest must change) and the stock pre-check below (a wrong construction
-cannot reproduce the vendor header).
-
-The camera also matches the package FILENAME against a wildcard pattern before
-it looks inside, so keep the vendor shape (e.g. Z_8_0312.bin, not
-Z_8_0311_mod.bin) or the file is invisible rather than rejected.
-
-Requires numpy (via decrypt_firmware).
+Requires NumPy via decrypt_firmware. See README.md for formats and migration.
 """
 
 import argparse
@@ -61,19 +29,13 @@ import decrypt_firmware as fw
 
 EX_PATCH = 7        # a patch could not be applied as given
 EX_VERIFY = 8       # our own output failed re-validation
-EX_DEPRECATED = 9   # --patch/--replace: module names changed meaning, re-aim it
+EX_DEPRECATED = 9   # old module selectors require migration
 
 
-# Module names used to be read from the PREVIOUS descriptor: the old reader
-# paired name[i+1] with extent[i] (see decrypt_firmware.parse_table). The shift
-# is POSITIONAL, not per-prefix, so the replacement for a name typed against the
-# old tool is the name of the record BEFORE it -- which can only be derived from
-# the directory in hand. A static prefix table is wrong as soon as a model has
-# two modules sharing a prefix: on a Z 6II/Z 7II, whose container carries an
-# `eg..._mas_...`/`eg..._sla_...` pair, old `eg..._sla_...` selected the extent
-# that is now named `eg..._mas_...`.
+# Old selectors paired name[i+1] with extent[i]. Migrate by directory position;
+# prefix mappings fail when modules share a prefix (e.g. eg master/slave).
 
-# Descriptions are keyed on the CURRENT name, so they are safe to hard-code.
+# Component descriptions use the corrected module names.
 DESCRIBES = [
     ("ex", "the external body-control micro"),
     ("_tpj01", "a second micro"),
@@ -91,14 +53,13 @@ def describe(name):
 
 
 def old_pairing(mods):
-    """Reconstruct what the old reader would have returned for this directory:
-    descriptor i's extent under descriptor i+1's name, last one unnamed."""
+    """Pair extent[i] with name[i+1], leaving the last extent unnamed."""
     return [((mods[i + 1][0] if i + 1 < len(mods) else "(unnamed)"),
              mods[i][1], mods[i][2]) for i in range(len(mods))]
 
 
 def resolve_as_old(mods, want):
-    """Apply the OLD selector to this directory. Returns (new_name, note)."""
+    """Resolve an old selector to (current_name, error_note)."""
     old = old_pairing(mods)
     hit = [m for m in old if m[0] == want] or [m for m in old if m[0].startswith(want)]
     if not hit:
@@ -129,9 +90,7 @@ def translate_specs(mods, specs, sep):
 
 
 def deprecation_notice(mods, patches, replaces):
-    """Explain the rename, rewrite the user's own flags from the directory in
-    hand, and exit. Never guesses: a selector that cannot be resolved gets an
-    explanation instead of a command line."""
+    """Print directory-based flag migrations and exit; do not guess unresolved selectors."""
     out = [
         "--patch and --replace are deprecated because module names changed meaning.",
         "",
@@ -171,13 +130,13 @@ def deprecation_notice(mods, patches, replaces):
     out += [
         "",
         "Then CHECK the 'module at body 0x...' line the repacker prints before you",
-        "flash anything. See the module-name warning in README.md.",
+        "flash anything. See 'Migrating old commands' in README.md.",
     ]
     fw.die(EX_DEPRECATED, "\n".join(out))
 
 
 def load_sig(path):
-    """Load K8, refusing a file that fails its own self_check."""
+    """Load the eight-byte K8 and verify its SHA-256 hash if present."""
     try:
         with open(path) as fh:
             doc = json.load(fh)
@@ -200,7 +159,7 @@ def load_sig(path):
 
 
 def sign(body, k8):
-    """The header digest for this body."""
+    """Return SHA1(body || K8)."""
     h = hashlib.sha1()
     h.update(body)
     h.update(k8)
@@ -208,7 +167,7 @@ def sign(body, k8):
 
 
 def find_module(mods, want):
-    """Exact module name, or an unambiguous prefix of one."""
+    """Resolve an exact module name or an unambiguous prefix."""
     hit = [m for m in mods if m[0] == want] or [m for m in mods if m[0].startswith(want)]
     if not hit:
         fw.die(EX_PATCH, "no module named %r; have %s"
@@ -220,7 +179,7 @@ def find_module(mods, want):
 
 
 def apply_patch(body, mods, spec):
-    """MODULE:OFFSET:HEXBYTES, offset relative to the module start."""
+    """Apply MODULE:OFFSET:HEXBYTES within the payload; offset is module-relative."""
     parts = spec.split(":")
     if len(parts) != 3:
         fw.die(EX_PATCH, "--patch-module wants MODULE:OFFSET:HEXBYTES, got %r" % spec)
@@ -249,7 +208,7 @@ def apply_patch(body, mods, spec):
 
 
 def apply_replace(body, mods, spec):
-    """MODULE=PATH, replacing the whole payload. Length must be unchanged."""
+    """Apply MODULE=PATH; replacement must match the payload size without CRC bytes."""
     if "=" not in spec:
         fw.die(EX_PATCH, "--replace-module wants MODULE=PATH, got %r" % spec)
     name, path = spec.split("=", 1)
@@ -329,13 +288,11 @@ def main():
         fw.die(fw.EX_SANITY, "%s: %s; refusing to start from a broken image."
                % (args.firmware, exc))
 
-    # The deprecation notice derives its advice from this directory, so it has to
-    # wait until the directory is in hand. Nothing is written before this point.
+    # Migration advice requires a validated directory.
     if args.patch or args.replace:
         deprecation_notice(mods, args.patch, args.replace)
 
-    # K8 belongs to one camera. If it does not verify the stock header, it is the
-    # wrong key and every signature we write would be wrong too.
+    # Confirm the model-specific K8 against the input before editing.
     stock = sign(plain[fw.HDR:], k8)
     if stock != plain[:20]:
         fw.die(fw.EX_KEY,
@@ -354,7 +311,7 @@ def main():
     out = digest + plain[20:fw.HDR] + bytes(body)   # header[20:32] uncovered, kept
     cipher = fw.decrypt(out, *key)            # XOR, so the same call re-encrypts
 
-    # Verify our own output the way the real tool would, before writing it.
+    # Check the cipher round trip, container integrity and digest before writing.
     check = fw.decrypt(cipher, *key)
     if check != out:
         fw.die(EX_VERIFY, "re-encryption did not round-trip; nothing written.")
@@ -368,8 +325,7 @@ def main():
         fw.die(EX_VERIFY, "selftest: output differs from the input in %d byte(s)."
                % sum(a != b for a, b in zip(cipher, raw)))
 
-    # Write via a temp file and rename. A short write straight to the destination
-    # would leave a truncated 100 MB file sitting there named like firmware.
+    # Rename only after a complete write; remove the temporary file on failure.
     tmp = args.out + ".tmp"
     try:
         with open(tmp, "wb") as fh:
@@ -387,8 +343,7 @@ def main():
     extents = {m[0]: (m[1], m[2]) for m in mods}
     for name, off, n in edits:
         start, length = extents[name]
-        # Print the resolved extent, not just the name: a patch aimed by name
-        # at the wrong module is otherwise invisible until it is flashed.
+        # Report the resolved extent so users can confirm the patch target.
         print("  patched       %s +0x%x, %d byte(s)" % (name, off, n))
         print("                module at body 0x%x, 0x%x bytes; wrote body 0x%x"
               % (start, length, start + off))

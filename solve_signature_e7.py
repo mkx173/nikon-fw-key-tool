@@ -1,48 +1,20 @@
 #!/usr/bin/env python3
-"""Recover the 8-byte signature key an EXPEED 7 legacy body appends before hashing.
+"""Recover the eight-byte header-digest key for legacy Z 8 / Z 9 images.
 
     python3 solve_signature_e7.py --key key.json \
-        --firmware Z_8_0311.bin Z_8_0300.bin --out sig.json
+        --firmware Z_8_0300.bin Z_8_0311.bin --out sig.json
 
-The 32-byte plaintext header is not opaque. Its first 20 bytes are a SHA-1:
-
-    header[0:20] == SHA1( decrypt(image)[0x20:] || K8 )
-
-The hashed message is the whole DECRYPTED body -- label, directory, every
-module and the checksum trailer, to end of file -- followed by 8 key bytes that
-are never stored in the image. header[20:32] is not covered and is not checked.
-
-K8 is a per-body constant, not per-version: the same 8 bytes verify every
-firmware revision of one camera. It is built in the camera from an 8-byte seed
-XORed with a short keystream,
+The digest is SHA1(decrypted_body || K8), including the checksum trailer.
+K8 = seed XOR k, where the seed is an eight-byte model-specific constant and:
 
     k[i] = (b + a * ((i + 1) * M + i * (i + 1) // 2)) & 0xFF
 
-so only (a, b, M) vary -- a cheap exhaustive search once the seed is known. The
-seed is a constant in the body itself, 24 bytes before the SHA-1 initialisation
-vector (stored little-endian, so `01 23 45 67 89 ab cd ef`), which is the anchor
-searched for here.
+Seed candidates sit 24 bytes before a SHA-1 initialisation-vector literal.
+Search all supported (a, b, M) combinations against each image's header;
+multiple revisions must agree on K8. Other models require a different seed
+recovery method and are rejected by model ID.
 
-## Scope: EXPEED 7 only -- the Z 8 and Z 9
-
-Those bodies hold the seed in a literal pool, so it can be read out of the image
-the user already supplied and nothing has to ship with this tool.
-
-The EXPEED 6 bodies -- Z 5, Z 6, Z 6II, Z 7, Z 7II, Z 30, Z 50, Z fc -- are
-refused up front, by the model id in the package name. They build the seed with
-`movz`/`movk` immediates instead, so there is no literal to find, and most of
-them do not use this keystream family at all. Recovering theirs needs a
-different method and belongs in its own script; this one says so rather than
-guessing. The id is checked directly because the IV literal alone does not
-distinguish the two: EXPEED 6 bodies contain one too, just not with a seed in
-front of it, so keying the test on the anchor misreports them as modified.
-
-No key material ships here. Recovering K8 needs one image whose header
-signature is intact -- a stock image, or one repack_firmware.py signed -- exactly
-as extract_key.py needs real images to recover T1/T2/T3. Give two or more images of the same camera and each is
-required to agree, which is what makes a hit trustworthy rather than lucky.
-
-Requires numpy (via decrypt_firmware).
+Requires NumPy via decrypt_firmware. See README.md for scope and verification.
 """
 
 import argparse
@@ -59,10 +31,9 @@ IV = bytes.fromhex("0123456789abcdef")  # SHA-1 H0,H1 as stored, little-endian
 SEED_DELTA = 24                 # the seed sits this far before the IV literal
 MULTIPLIERS = (0x260, 0xD3)     # the two keystream variants present in shipped code
 
-# Model id from the package name, e.g. "ex2070_030000.bi" -> 2070. The legacy
-# scheme's EXPEED 7 bodies are exactly these two.
+# Model ID from the first module name, e.g. ex2070_030000.bi -> 2070.
 E7_MODELS = {"2070": "Z 8", "1990": "Z 9"}
-PACKAGE_RE = re.compile(r"[A-Za-z]{2}(\d{4})")
+MODEL_RE = re.compile(r"[A-Za-z]{2}(\d{4})")
 
 EX_UNSOLVED = 6     # no candidate keystream reproduced the header digest
 EX_SCOPE = 9        # not an EXPEED 7 body
@@ -87,32 +58,32 @@ def candidates():
             for mul in MULTIPLIERS for a in range(256) for b in range(256)]
 
 
-def package_name(plain):
-    """The 16-byte package name from the directory header record."""
+def first_module_name(plain):
+    """Read the first module name at body 0x30 for model identification."""
     return bytes(plain[fw.HDR + 0x30:fw.HDR + 0x40]).rstrip(b"\0").decode(
         "ascii", "replace")
 
 
 def require_expeed7(plain, path):
     """Refuse anything but a Z 8 or Z 9, naming what was seen."""
-    package = package_name(plain)
-    found = PACKAGE_RE.match(package)
+    module = first_module_name(plain)
+    found = MODEL_RE.match(module)
     model = found.group(1) if found else None
     if model not in E7_MODELS:
         fw.die(EX_SCOPE,
-               "%s is model id %s (package %r), which this tool does not handle.\n"
+               "%s is model id %s (module %r), which this tool does not handle.\n"
                "       Only the EXPEED 7 legacy bodies are supported: %s.\n"
                "       The EXPEED 6 bodies -- Z 5, Z 6, Z 6II, Z 7, Z 7II, Z 30,\n"
                "       Z 50, Z fc -- build the seed from immediates instead of a\n"
                "       literal, so recovering theirs needs a different method and\n"
                "       belongs in its own script."
-               % (os.path.basename(path), model or "unknown", package,
+               % (os.path.basename(path), model or "unknown", module,
                   ", ".join("%s (%s)" % (n, i) for i, n in sorted(E7_MODELS.items()))))
     return E7_MODELS[model]
 
 
 def seed_offsets(plain, path):
-    """Where the seed literal sits, from the IV anchor."""
+    """Return candidate seed offsets 24 bytes before each SHA-1 IV literal."""
     offsets, pos = [], plain.find(IV)
     while pos >= 0:
         if pos - SEED_DELTA >= 0:
@@ -127,7 +98,7 @@ def seed_offsets(plain, path):
 
 
 def load_image(key, path):
-    """Decrypt, insist the structure is intact, and return (header, plaintext)."""
+    """Decrypt and validate an image; return (header, plaintext)."""
     try:
         raw = open(path, "rb").read()
     except OSError as exc:
@@ -146,7 +117,7 @@ def load_image(key, path):
 
 
 def solve(hdr, plain, cands, path):
-    """Find the K8 whose digest reproduces header[0:20]. None if nothing fits."""
+    """Return a key matching header[:20], or None if no candidate matches."""
     want = hdr[:20]
     base = hashlib.sha1(memoryview(plain)[fw.HDR:])
     for off in seed_offsets(plain, path):

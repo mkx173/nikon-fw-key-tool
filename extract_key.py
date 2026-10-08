@@ -1,45 +1,15 @@
 #!/usr/bin/env python3
 """
-Recover the generation-wide Nikon "legacy scheme" keystream tables.
+Recover the shared XOR tables from legacy Nikon firmware images.
 
-    python3 extract_key.py --firmware-dir firmware/expeed6 --out tables/key.json
+    python3 extract_key.py --firmware-dir firmware --out key.json
 
-The legacy scheme (Z 5, Z 6, Z 6II, Z 7, Z 7II, Z 8, Z 30, Z 50, Z fc) is a
-three-table XOR keystream over the file body, which starts at offset 0x20.
-Body bytes 0x00-0x1F are a plaintext 32-space label; the keystream index still
-counts them, so XOR starts at i = 0x20:
+Repeated padding sectors reveal T1; directory plausibility fixes its global
+constant. Padding observations then determine T2 and T3 by majority propagation.
+A final pass resolves T3 fill ambiguity. All images must pass directory and CRC
+validation before the key is written. See README.md for coverage requirements.
 
-    plain[0x20 + i] = cipher[0x20 + i] ^ T1[i & 0xFF] ^ T2[(i>>8) & 0xFF] ^ T3[(i>>16) & 0xFF]
-
-T1/T2/T3 are 256 bytes each and identical across all nine bodies, so the
-keystream period is 2^24 (16 MB). A "sector" is 256 body bytes; sector index
-j = i // 256 selects a = j & 0xFF in T2 and b = (j >> 8) & 0xFF in T3, so one
-whole sector shares the single constant T2[a] ^ T3[b].
-
-Recovery, in five stages plus validation:
-
- 1. T1 up to a global constant. Each image holds thousands of constant-filled
-    plaintext sectors, whose ciphertexts are the family {T1 ^ c}. Normalising
-    every repeated sector value by its own first byte collapses that family to
-    one value, T1 ^ T1[0]; the largest such group is it. All images agree.
-
- 2. The global constant, via the module table. Only the right constant makes
-    the directory at body+0x20 parse into ASCII module names with a
-    self-consistent offset chain. This fixes the gauge T2[0] = T3[0] = 0.
-
- 3. Ground truth for T2 ^ T3. XOR every sector by T1; whatever becomes
-    constant-valued is padding, giving an observation (a, b) -> T2[a] ^ T3[b].
-    Pooled across the supplied images, majority vote per cell.
-
- 4. T2 and T3 by bipartite majority propagation over those observations.
-
- 5. Per-block re-derivation of T3. Padding is ambiguous between zero-fill
-    and ff-fill, so blocks can come out complemented; see correct_t3.
-
- 6. Validation. Every image must pass decrypt_firmware's directory and CRC16
-    checks, or no key file is written.
-
-Requires numpy.
+Requires NumPy.
 """
 
 import argparse
@@ -61,11 +31,7 @@ SEC = 256           # sector size == T1 period
 TABLE = 0x20        # module directory offset within the body
 NAME_RE = re.compile(rb"[0-9A-Za-z_][0-9A-Za-z_.]{2,15}\Z")
 
-# A sufficient set is decided by coverage, not by a fixed file list: every one
-# of the 256 T3 blocks needs at least one image carrying constant-fill padding
-# at that keystream offset. Four images can do it -- exactly one of the 126
-# four-subsets of the nine known images does, so MINIMAL names it for the
-# error hint. Any other set that reaches full coverage works just as well.
+# Known-sufficient coverage of all 256 T3 padding blocks; used in error hints.
 MINIMAL = ("Z_8_0311.bin", "Z7_2_0170.bin", "Z_6_0380.bin", "Z_50_0260.bin")
 
 KNOWN = {
@@ -136,18 +102,12 @@ def recover_family(sectors):
 
 
 def parse_table(plain_body, limit=64):
-    """Read the module directory.
+    """Read a partial directory for T1 candidate scoring, not validation.
 
-    At body+0x20 sits a header record, then `count` 32-byte descriptors:
-
-        0x20          [BE32 count][BE32 dirsize][8 pad][16-byte package name]
-        0x20+32*(i+1) [BE32 offset][BE32 length][8 pad][16-byte module name]
-
-    dirsize == 48 + 32 * count. Descriptors chain exactly
-    (offset + length == next offset) from the first one and close 16 bytes
-    before end-of-body. Names are NUL-padded and truncated at 16 characters,
-    so a long one loses its extension ("eg1850_mas_01700"); do not require
-    one. The final descriptor is the trailing payload and carries no name.
+    Extents are at body 0x40 + 32 * i. This probe retains the old shifted
+    name lookup at extent + 16, so labels refer to the next descriptor and
+    the last extent may be omitted from a short buffer. Final validation
+    uses decrypt_firmware.parse_table for the complete, correctly named table.
     """
     mods = []
     if len(plain_body) < 0x40:
@@ -202,7 +162,7 @@ def collect_observations(images, t1):
         keys.append((a << 16) | (b << 8) | xored[j, 0].astype(np.uint32))
     keys = np.concatenate(keys)
     uniq, counts = np.unique(keys, return_counts=True)
-    # within each (a, b) cell the last entry after this sort is the majority
+    # Sort by cell and count so each cell ends with its majority value.
     order = np.lexsort((counts, uniq >> 8))
     uniq, counts = uniq[order], counts[order]
     cell = uniq >> 8
@@ -247,19 +207,12 @@ def solve_tables(obs):
 
 
 def correct_t3(images, t1, t2, t3):
-    """Re-derive each T3[b] directly from the data.
+    """Re-derive each T3 entry from byte frequencies across its blocks.
 
-    The majority solve can land on a constant offset by an arbitrary byte when
-    some other fill value dominates a block's padding, so do not trust it and
-    do not merely test the complement. For each block score every candidate by
-    cnt[c] + cnt[c ^ 0xFF]; that sum is symmetric under complement, so it picks
-    the correct {c, c^0xFF} pair without being able to prefer one over the
-    other. Then take whichever member yields more 0x00.
-
-    Deliberately NOT scored on printable text: UTF-16LE strings are
-    (char, 0x00) pairs, and XORing those with a printable constant produces a
-    run that is both printable and highly varied, so a text metric reliably
-    picks the wrong constant in localised-string blocks.
+    Maximise cnt[c] + cnt[c ^ 0xFF] to select a zero/FF-fill pair, then
+    choose the member producing more zeros. Consider all 256 candidates:
+    the majority solve may have an arbitrary offset, not just a complement.
+    Printable-text scoring misidentifies XORed UTF-16LE strings.
     """
     base = t1 ^ t2[:, None]             # base[a] = T1 ^ T2[a]; still needs ^ T3[b]
     changed = []
@@ -286,7 +239,7 @@ def correct_t3(images, t1, t2, t3):
 
 
 def validate(dirname, images, t1, t2, t3):
-    """Every image must pass the decrypter's directory and CRC16 checks."""
+    """Return whether every image passes directory and CRC validation."""
     ok = True
     for name, _, _ in images:
         raw = open(os.path.join(dirname, name), "rb").read()
