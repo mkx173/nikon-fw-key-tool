@@ -34,13 +34,13 @@ def make_body(payloads=None):
     count = len(payloads)
     directory_size = 48 + 32 * count
     body = bytearray(b" " * 32)
-    body += struct.pack(">II8x16s", count, directory_size, b"package_0120.bin")
+    body += struct.pack(">II8x", count, directory_size)
     modules = [payload + reference_crc(payload) for payload in payloads]
     start = directory_size
     for i, module in enumerate(modules):
+        # Name first, then the extent -- see parse_table.
+        body += ("module%d.bin" % (i + 1)).encode().ljust(16, b"\0")
         body += struct.pack(">II8x", start, len(module))
-        if i < count - 1:
-            body += ("module%d.bin" % (i + 1)).encode().ljust(16, b"\0")
         start += len(module)
     for module in modules:
         body += module
@@ -55,18 +55,19 @@ class ValidationTests(unittest.TestCase):
     def test_independent_crc_fixture(self):
         self.assertEqual(reference_crc(b"123456789"), bytes.fromhex("31c3"))
 
-    def test_valid_low_zero_image_and_unnamed_final_descriptor(self):
+    def test_valid_low_zero_image_and_every_descriptor_named(self):
         self.assertLess(self.body.count(0) / len(self.body), 0.20)
         mods = fw.validate_firmware(self.body)
         self.assertEqual(len(mods), 2)
         self.assertEqual(mods[0], ("module1.bin", 112, 1026))
-        self.assertEqual(mods[-1][0], "(unnamed)")
-        # These are payload bytes, not a name for the final descriptor.
+        self.assertEqual(mods[1], ("module2.bin", 1138, 2042))
+        # The directory closes exactly at the first module; these are payload
+        # bytes, and under the old off-by-one they were read as a name.
         self.assertEqual(self.body[112:128], b"\xff" * 16)
 
-    def test_single_unnamed_module_with_empty_payload(self):
+    def test_single_named_module_with_empty_payload(self):
         self.assertEqual(fw.validate_firmware(make_body([b""])),
-                         [("(unnamed)", 80, 2)])
+                         [("module1.bin", 80, 2)])
 
     def test_module_data_or_checksum_corruption_even_with_valid_package_crc(self):
         for index in (112, 112 + 1025, 1138, len(self.body) - 17):
@@ -79,7 +80,9 @@ class ValidationTests(unittest.TestCase):
 
     def test_package_crc_covers_directory(self):
         body = self.body.copy()
-        body[80] = ord("n")  # Valid new name; extents/module CRCs remain valid.
+        # Valid replacement name byte in descriptor 2; extents and module
+        # CRCs stay valid, so only the package CRC can catch it.
+        body[80] = ord("n")
         with self.assertRaisesRegex(ValueError, "package CRC mismatch"):
             fw.validate_firmware(body)
 
@@ -173,6 +176,46 @@ class ValidationTests(unittest.TestCase):
             destination.unlink()
             self.assertEqual(self.run_cli(keyfile, source, destination)[0], fw.EX_SANITY)
             self.assertFalse(destination.exists())
+
+
+class DeprecatedFlagTests(unittest.TestCase):
+    """--patch/--replace must refuse and explain, before touching any file."""
+
+    def run_repack(self, *extra):
+        import repack_firmware as rp
+        argv = ["repack_firmware.py", "--key", "/nonexistent", "--sig", "/nonexistent",
+                "--firmware", "/nonexistent", "--out", "/nonexistent/out.bin"]
+        argv += list(extra)
+        with mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            try:
+                code = rp.main()
+            except SystemExit as exc:
+                code = exc.code
+        return code, errors.getvalue()
+
+    def test_patch_is_deprecated_and_translated(self):
+        code, errors = self.run_repack("--patch", "vr2070_010100.bi:0x1000:dead")
+        self.assertEqual(code, 9)
+        self.assertIn("deprecated", errors)
+        # 'vr' used to select the main application, which is now named 'eg'.
+        self.assertIn("--patch-module eg:0x1000:dead", errors)
+
+    def test_replace_is_deprecated_and_translated(self):
+        code, errors = self.run_repack("--replace", "li=/tmp/blob.bin")
+        self.assertEqual(code, 9)
+        self.assertIn("--replace-module vr=/tmp/blob.bin", errors)
+
+    def test_unrecognised_prefix_is_flagged_not_translated(self):
+        code, errors = self.run_repack("--patch", "zz9:0:00")
+        self.assertEqual(code, 9)
+        self.assertIn("not one of the renamed prefixes", errors)
+
+    def test_new_flags_are_not_deprecated(self):
+        # Must get past the deprecation gate and fail on the missing key instead.
+        code, _ = self.run_repack("--patch-module", "eg:0x1000:dead")
+        self.assertNotEqual(code, 9)
 
 
 if __name__ == "__main__":

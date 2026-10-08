@@ -24,7 +24,7 @@ The newer bodies (Z 5II, Z 50II, Z 6III, ZR) put them at 0x260 and use a
 different, unbroken scheme -- those are rejected here.
 
 Decrypted layout: a 32-byte header, space label, module directory and payloads.
-Named descriptors are 32 bytes; the final, unnamed descriptor is 16 bytes.
+Every descriptor is 32 bytes and the name comes first, before the extent.
 Module extents must chain exactly. Each module and the complete body carry
 CRC16 checksums which are verified before any output is written.
 
@@ -126,18 +126,33 @@ def decrypt(raw, t1, t2, t3):
 def parse_table(plain_body, limit=64):
     """Read a complete module directory, rejecting invalid extents/names.
 
-    At body+0x20 sits a header record, then `count` descriptors:
+    At body+0x20 sits a 16-byte header, then `count` 32-byte descriptors in
+    which THE NAME COMES FIRST:
 
-        0x20          [BE32 count][BE32 dirsize][8 pad][16-byte package name]
-        named:       [BE32 offset][BE32 length][8 pad][16-byte module name]
-        final:       [BE32 offset][BE32 length][8 pad]
+        0x20   [BE32 count][BE32 dirsize][8 pad]
+        0x30   `count` x [16-byte module name][BE32 offset][BE32 length][8 pad]
 
-    dirsize == 48 + 32 * count. Descriptors chain exactly
-    (offset + length == next offset) from the first one and close 16 bytes
-    before end-of-body. Names are NUL-padded and truncated at 16 characters,
-    so a long one loses its extension ("eg1850_mas_01700"); do not require
-    one. Offsets are relative to the body. Lengths include the module CRC.
-    Raises ValueError rather than returning a partial directory.
+    dirsize == 48 + 32 * count == 0x30 + 0x20 * count, which is where the
+    first module starts, so the directory closes exactly with no leftover.
+
+    This ordering is what the camera's own reader walks: on an EXPEED 7 body
+    0x4101dee0 -> 0x41016b24 copies body[0x30:dirsize], case-folds the first
+    0x10 bytes of each 0x20-byte record (the name) and byte-swaps the two BE32
+    words at record+0x10/+0x14 (offset and length).
+
+    An earlier version of this function read the extent at descriptor+0x00 and
+    the name at descriptor+0x10, treating body+0x30 as a "package name" and
+    the last descriptor as 16 bytes and unnamed. Every byte position happens to
+    coincide, so extents and CRCs were unaffected and no checksum ever caught
+    it -- but each module was reported under the PREVIOUS descriptor's name.
+    That mislabelled the main application as "vr", the Linux image as unnamed,
+    and the body micro as "_tpj01"; a --patch aimed by name hit the wrong
+    module entirely.
+
+    Names are NUL-padded and truncated at 16 characters, so a long one loses
+    its extension ("eg1850_mas_01700"); do not require one. Offsets are
+    relative to the body. Lengths include the module CRC. Raises ValueError
+    rather than returning a partial directory.
     """
     if len(plain_body) < TABLE + 32 + 16 + TRAILER:
         raise ValueError("truncated module directory or checksum trailer")
@@ -159,17 +174,16 @@ def parse_table(plain_body, limit=64):
 
     if plain_body[TABLE + 8:TABLE + 16] != b"\0" * 8:
         raise ValueError("nonzero directory reserved bytes")
-    read_name(plain_body[TABLE + 16:TABLE + 32], "package")
 
     mods = []
     expected_start = dirsize
     for i in range(count):
-        off = TABLE + (i + 1) * 32
-        start, length = struct.unpack_from(">II", plain_body, off)
-        if plain_body[off + 8:off + 16] != b"\0" * 8:
-            raise ValueError("module %d has nonzero reserved bytes" % (i + 1))
-        name = (read_name(plain_body[off + 16:off + 32], "module %d" % (i + 1))
-                if i < count - 1 else "(unnamed)")
+        off = TABLE + 16 + i * 32
+        name = read_name(plain_body[off:off + 16], "module %d" % (i + 1))
+        start, length = struct.unpack_from(">II", plain_body, off + 16)
+        if plain_body[off + 24:off + 32] != b"\0" * 8:
+            raise ValueError("module %d (%s) has nonzero reserved bytes"
+                             % (i + 1, name))
         if start != expected_start:
             raise ValueError("module %d (%s) starts at 0x%x, expected 0x%x"
                              % (i + 1, name, start, expected_start))

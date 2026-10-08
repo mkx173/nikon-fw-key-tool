@@ -89,7 +89,7 @@ python3 solve_signature_e7.py --key <key.json> --firmware <stock.bin> [...] \
     --out <sig.json>
 python3 repack_firmware.py --key <key.json> --sig <sig.json> \
     --firmware <in.bin> --out <out.bin> \
-    --patch <module>:<offset>:<hexbytes>
+    --patch-module <module>:<offset>:<hexbytes>
 ```
 
 **Every parameter is named.** There are no positional arguments anywhere, so no
@@ -180,15 +180,52 @@ rather than XORed. The header is plaintext too, and its first 20 bytes are the
 SHA-1 described in [The header signature](#the-header-signature); the remaining
 12 are unidentified and unchecked.
 
-The decrypted body opens with a module directory at body `0x20`: a 32-byte
-header record, then `count - 1` named descriptors of 32 bytes and a final
-unnamed descriptor of 16 bytes.
+> **Module names changed meaning in this revision.** Earlier versions paired
+> every module with the *previous* descriptor's name, so what they listed as
+> `vr` was the main application, what they listed as `eg` was a 57 KB micro,
+> and the Linux image had no name at all. Decryption, validation and
+> checksums were never affected — the extents were always read correctly — and
+> packages built with the old naming were self-consistent, because the name you
+> typed matched the module the tool had just listed next to it.
+>
+> **`--patch` and `--replace` are therefore deprecated and now refuse to run.**
+> They exit `9` and print the rename table with your own flags rewritten, rather
+> than silently resolving to a different module: `--patch vr:0x1000` used to land
+> in the main application and would now land in the vibration-reduction unit, and
+> it would still succeed. Use `--patch-module` and `--replace-module`, which have
+> the corrected semantics, and check the `module at body 0x…` line the repacker
+> prints before you flash anything built from an old command line.
+>
+> | old name | was really | now called |
+> | --- | --- | --- |
+> | `_tpj01` | the external body-control micro | `ex` |
+> | `eg` | the second micro | `_tpj01` |
+> | `vr` | the main application | `eg` |
+> | `li` | the vibration-reduction unit (`NikonBVR`) | `vr` |
+> | `(unnamed)` | the Linux image | `li` |
+
+The decrypted body opens with a module directory at body `0x20`: a 16-byte
+header, then `count` descriptors of 32 bytes each, in which **the name comes
+first**, before the extent.
 
 ```
-0x20            [BE32 count][BE32 dirsize][8 pad][16-byte package name]
-named record    [BE32 offset][BE32 length][8 pad][16-byte module name]
-final record    [BE32 offset][BE32 length][8 pad]
+0x20            [BE32 count][BE32 dirsize][8 pad]
+0x30            count x [16-byte module name][BE32 offset][BE32 length][8 pad]
 ```
+
+This is the order the camera's own reader uses: on an EXPEED 7 body
+`0x4101dee0` -> `0x41016b24` copies `body[0x30:dirsize]`, case-folds the first
+`0x10` bytes of each `0x20`-byte record to match it against patterns like
+`EG2010_?????????`, and byte-swaps the two BE32 words at `record+0x10` and
+`record+0x14`.
+
+Earlier versions of this tool read the extent at `descriptor+0x00` and the name
+at `descriptor+0x10`, treating `body+0x30` as a package name and the last
+descriptor as a 16-byte unnamed one. Every byte position coincides between the
+two readings, so extents and checksums were unaffected and no validation ever
+caught it — but each module was reported under the *previous* descriptor's
+name, which mislabelled the main application as `vr`, the Linux image as
+unnamed, and the body micro as `_tpj01`.
 
 The decrypter requires a complete directory with valid names and zero reserved
 bytes. Module lengths include their two-byte CRC and must be at least two.
@@ -200,14 +237,29 @@ Offsets are relative to the body, all extents must be in bounds, and:
 - the last descriptor ends exactly 16 bytes before end-of-body
 
 Names are NUL-padded and truncated at 16 characters, so a long one loses its
-extension (`eg1850_mas_01700`). The final descriptor points to an ordinary
-checksummed module and carries no name. Names encode the version, e.g.
+extension (`eg1850_mas_01700`). Names encode the version, e.g.
 `eg1985_018100.bi` in `Z_fc_0181.bin`; the Z 6II/Z 7II carry `_mas_`/`_sla_` pairs matching their
 dual-EXPEED hardware. The four-digit field is a model id, not a version —
 `1985` is the Z fc, `1990` the Z 9, `2070` the Z 8 — so `Z_9_0532.bin` holds
 `eg1990_053200.bi`, `vr1990_010200.bi` and `li1990_053200.bi`. Some
 package/component names retain older versions, so filename version matching is
 advisory.
+
+The prefix identifies the component, and with the directory read correctly the
+names line up with what each module demonstrably is:
+
+| prefix | typical size | component |
+| --- | --- | --- |
+| `ex` | `0x80002` | the external body-control micro ("ExMCU") |
+| `_tpj01` | `0xe002` | a second micro |
+| `eg` | tens of MB | the main application — the camera's "Engine" image |
+| `vr` | `0xccc08` | the vibration-reduction / IBIS unit, magic `NikonBVR` |
+| `li` | MB | the Linux image for the second core, magic `NISI` |
+
+`eg` is the big one: it is the module whose name version tracks the release, it
+is byte-identical to what the body executes, and it carries a `Ver.MM.mm.xx`
+trailer in its last 15 bytes. Bodies without a Linux core, such as the Z 6,
+have no `li` module at all.
 
 Each module ends in a big-endian CRC16 of all preceding bytes in that module.
 The body ends in a 16-byte trailer: a big-endian CRC16 of the body excluding

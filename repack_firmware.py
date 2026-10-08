@@ -61,6 +61,72 @@ import decrypt_firmware as fw
 
 EX_PATCH = 7        # a patch could not be applied as given
 EX_VERIFY = 8       # our own output failed re-validation
+EX_DEPRECATED = 9   # --patch/--replace: module names changed meaning, re-aim it
+
+
+# Module names used to be read from the PREVIOUS descriptor (see
+# decrypt_firmware.parse_table). The shift is by exactly one in every image, so
+# a name typed against the old tool can be translated without the file.
+RENAMED = [
+    ("_tpj01", "ex", "the external body-control micro"),
+    ("eg", "_tpj01", "the second micro"),
+    ("vr", "eg", "the main application"),
+    ("li", "vr", "the vibration-reduction unit (NikonBVR)"),
+]
+
+
+def deprecation_notice(patches, replaces):
+    """Explain the rename and rewrite the user's own flags, then exit."""
+    out = [
+        "--patch and --replace are deprecated because module names changed meaning.",
+        "",
+        "This tool used to pair each module with the PREVIOUS descriptor's name, so",
+        "the name you typed selected a different module than it does now. Decryption",
+        "and checksums were never affected, and packages built with the old naming are",
+        "self-consistent -- but a command line written against it now resolves to the",
+        "wrong module and would still succeed.",
+        "",
+    ]
+    rows = [(o, w, n) for o, n, w in RENAMED] + [
+        ("(unnamed)", "the Linux image", "li")]
+    w0 = max(len(r[0]) for r in rows + [("name you typed",)])
+    w1 = max(len(r[1]) for r in rows + [(None, "was really")])
+    out.append("  %-*s  %-*s  %s" % (w0, "name you typed", w1, "was really",
+                                     "which is now called"))
+    out.append("  %s  %s  %s" % ("-" * w0, "-" * w1, "-" * 19))
+    for old_p, what, new_p in rows:
+        out.append("  %-*s  %-*s  %s" % (w0, old_p, w1, what, new_p))
+    out += [
+        "",
+        "Re-aim it and use the new flags, which have the corrected semantics:",
+        "",
+    ]
+
+    def translate(spec, sep):
+        name = spec.split(sep, 1)[0]
+        for old_p, new_p, _ in RENAMED:
+            if name.startswith(old_p):
+                rest = spec[len(name):]
+                return "%s%s" % (new_p, rest), name, new_p
+        return spec, name, None
+
+    for flag, specs, sep in (("--patch-module", patches, ":"),
+                             ("--replace-module", replaces, "=")):
+        for spec in specs:
+            fixed, name, new_p = translate(spec, sep)
+            if new_p:
+                out.append("  %s %s" % (flag, fixed))
+                out.append("      (%r used to mean the module now named %r)" % (name, new_p))
+            else:
+                out.append("  %s %s" % (flag, spec))
+                out.append("      (%r is not one of the renamed prefixes; verify it yourself)"
+                           % name)
+    out += [
+        "",
+        "Then CHECK the 'module at body 0x...' line the repacker prints before you",
+        "flash anything. See the module-name warning in README.md.",
+    ]
+    fw.die(EX_DEPRECATED, "\n".join(out))
 
 
 def load_sig(path):
@@ -110,7 +176,7 @@ def apply_patch(body, mods, spec):
     """MODULE:OFFSET:HEXBYTES, offset relative to the module start."""
     parts = spec.split(":")
     if len(parts) != 3:
-        fw.die(EX_PATCH, "--patch wants MODULE:OFFSET:HEXBYTES, got %r" % spec)
+        fw.die(EX_PATCH, "--patch-module wants MODULE:OFFSET:HEXBYTES, got %r" % spec)
     name, off_s, hex_s = parts
     try:
         off = int(off_s, 0)
@@ -138,7 +204,7 @@ def apply_patch(body, mods, spec):
 def apply_replace(body, mods, spec):
     """MODULE=PATH, replacing the whole payload. Length must be unchanged."""
     if "=" not in spec:
-        fw.die(EX_PATCH, "--replace wants MODULE=PATH, got %r" % spec)
+        fw.die(EX_PATCH, "--replace-module wants MODULE=PATH, got %r" % spec)
     name, path = spec.split("=", 1)
     mod_name, start, length = find_module(mods, name)
     payload = length - 2
@@ -169,7 +235,7 @@ def main():
         description=__doc__.split("\n")[1],
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Exit codes: 2 usage, 3 bad key, 4 wrong scheme, 5 invalid structure, "
-               "7 bad patch, 8 output failed verification.")
+               "7 bad patch, 8 output failed verification, 9 deprecated flag.")
     ap.add_argument("--key", required=True, help="key JSON from extract_key.py")
     ap.add_argument("--sig", required=True,
                     help="signature key JSON from solve_signature_e7.py")
@@ -178,13 +244,22 @@ def main():
     ap.add_argument("--out", required=True, help="repacked encrypted .bin to write")
     ap.add_argument("--force", action="store_true",
                     help="replace --out if it already exists")
-    ap.add_argument("--patch", action="append", default=[], metavar="MODULE:OFF:HEX",
+    ap.add_argument("--patch-module", action="append", default=[],
+                    metavar="MODULE:OFF:HEX",
                     help="patch bytes in a module, repeatable")
-    ap.add_argument("--replace", action="append", default=[], metavar="MODULE=PATH",
+    ap.add_argument("--replace-module", action="append", default=[],
+                    metavar="MODULE=PATH",
                     help="replace a module payload from a file, repeatable")
+    ap.add_argument("--patch", action="append", default=[], metavar="MODULE:OFF:HEX",
+                    help="DEPRECATED, exits 9: module names changed meaning; "
+                         "use --patch-module")
+    ap.add_argument("--replace", action="append", default=[], metavar="MODULE=PATH",
+                    help="DEPRECATED, exits 9: use --replace-module")
     ap.add_argument("--selftest", action="store_true",
                     help="repack with no edits; the output must be bit-identical to the input")
     args = ap.parse_args()
+    if args.patch or args.replace:
+        deprecation_notice(args.patch, args.replace)
     fw.refuse_clobber(args.out, args.force)
 
     if os.path.realpath(args.out) == os.path.realpath(args.firmware):
@@ -220,10 +295,10 @@ def main():
     print("stock signature verified with the given K8")
 
     body = bytearray(plain[fw.HDR:])
-    edits = [apply_patch(body, mods, s) for s in args.patch]
-    edits += [apply_replace(body, mods, s) for s in args.replace]
+    edits = [apply_patch(body, mods, s) for s in args.patch_module]
+    edits += [apply_replace(body, mods, s) for s in args.replace_module]
     if args.selftest and edits:
-        fw.die(fw.EX_USAGE, "--selftest makes no edits; drop --patch/--replace")
+        fw.die(fw.EX_USAGE, "--selftest makes no edits; drop --patch-module/--replace-module")
 
     digest = reseal(body, mods, k8)
     out = digest + plain[20:fw.HDR] + bytes(body)   # header[20:32] uncovered, kept
@@ -259,8 +334,14 @@ def main():
 
     print("\nwrote %s" % args.out)
     print("  size          %d bytes" % len(cipher))
+    extents = {m[0]: (m[1], m[2]) for m in mods}
     for name, off, n in edits:
+        start, length = extents[name]
+        # Print the resolved extent, not just the name: a patch aimed by name
+        # at the wrong module is otherwise invisible until it is flashed.
         print("  patched       %s +0x%x, %d byte(s)" % (name, off, n))
+        print("                module at body 0x%x, 0x%x bytes; wrote body 0x%x"
+              % (start, length, start + off))
     print("  header SHA-1  %s" % digest.hex())
     print("  checksums     %d module CRCs + package CRC recomputed" % len(mods))
     print("  cipher bytes  %d differ from the input"
