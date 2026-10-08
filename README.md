@@ -196,6 +196,11 @@ SHA-1 described in [The header signature](#the-header-signature); the remaining
 > the corrected semantics, and check the `module at body 0x…` line the repacker
 > prints before you flash anything built from an old command line.
 >
+> The shift is **positional, not per-prefix**: the old reader paired
+> `name[i+1]` with `extent[i]`, so the replacement for a name you typed is the
+> name of the record *before* it. For the common five-module container that
+> comes out as:
+>
 > | old name | was really | now called |
 > | --- | --- | --- |
 > | `_tpj01` | the external body-control micro | `ex` |
@@ -203,6 +208,14 @@ SHA-1 described in [The header signature](#the-header-signature); the remaining
 > | `vr` | the main application | `eg` |
 > | `li` | the vibration-reduction unit (`NikonBVR`) | `vr` |
 > | `(unnamed)` | the Linux image | `li` |
+>
+> but do not apply that table by hand to every body. A Z 6II/Z 7II container
+> carries an `eg..._mas_...`/`eg..._sla_...` pair, where old `eg..._sla_...`
+> selected the extent now named `eg..._mas_...` — not `_tpj01`. The deprecation
+> notice derives the mapping from the directory of the image you pass it and
+> prints your own flags rewritten; where a selector was ambiguous or unmatched
+> under the old naming it says so and offers no command line rather than
+> guessing.
 
 The decrypted body opens with a module directory at body `0x20`: a 16-byte
 header, then `count` descriptors of 32 bytes each, in which **the name comes

@@ -179,42 +179,83 @@ class ValidationTests(unittest.TestCase):
 
 
 class DeprecatedFlagTests(unittest.TestCase):
-    """--patch/--replace must refuse and explain, before touching any file."""
+    """--patch/--replace must refuse, and derive their advice from the real
+    directory rather than a static prefix table."""
 
-    def run_repack(self, *extra):
+    # (name, body offset, length) -- only name and offset are consulted.
+    FIVE = [("ex2010_0200a0.bi", 0xd0, 0x80002),
+            ("_tpj01_0210.bin", 0x800d2, 0xe002),
+            ("eg2010_0200i1.bi", 0x8e0d4, 0x54b719f),
+            ("vr2010_010000.bi", 0x5545273, 0xccc08),
+            ("li2010_0200i1.bi", 0x5611e7b, 0x1a1f002)]
+
+    # A Z 6II/Z 7II-shaped container: two modules share the `eg` prefix, which
+    # is what breaks any static prefix mapping.
+    DUAL = [("ex1850_017000.bi", 0xf0, 0x80002),
+            ("_tpj01_0210.bin", 0x800f2, 0xe002),
+            ("eg1850_mas_0170", 0x8e0f4, 0x1000000),
+            ("eg1850_sla_0170", 0x108e0f4, 0x1000000),
+            ("vr1850_010000.bi", 0x208e0f4, 0xccc08),
+            ("li1850_017000.bi", 0x215acfc, 0x900002)]
+
+    def resolve(self, mods, want):
+        import repack_firmware as rp
+        return rp.resolve_as_old(mods, want)
+
+    def test_positional_shift_on_a_five_module_container(self):
+        for old_name, expected in (("_tpj01_0210.bin", "ex2010_0200a0.bi"),
+                                   ("eg2010_0200i1.bi", "_tpj01_0210.bin"),
+                                   ("vr2010_010000.bi", "eg2010_0200i1.bi"),
+                                   ("li2010_0200i1.bi", "vr2010_010000.bi"),
+                                   ("(unnamed)", "li2010_0200i1.bi")):
+            with self.subTest(old_name=old_name):
+                new_name, note = self.resolve(self.FIVE, old_name)
+                self.assertEqual(new_name, expected, note)
+
+    def test_shared_prefix_is_resolved_positionally_not_by_prefix(self):
+        """The regression this derivation exists for: on a dual-EXPEED body the
+        old selector eg..._sla_... chose the extent now named eg..._mas_..., and
+        a static prefix table would have sent the user to _tpj01 instead -- a
+        valid extent, so the mis-aimed patch would have succeeded silently."""
+        new_name, note = self.resolve(self.DUAL, "eg1850_sla_0170")
+        self.assertEqual(new_name, "eg1850_mas_0170", note)
+        self.assertNotEqual(new_name, "_tpj01_0210.bin")
+
+    def test_ambiguous_old_selector_gets_no_rewrite(self):
+        new_name, note = self.resolve(self.DUAL, "eg")
+        self.assertIsNone(new_name)
+        self.assertIn("matched 2 modules", note)
+
+    def test_unknown_old_selector_gets_no_rewrite(self):
+        new_name, note = self.resolve(self.FIVE, "zz9")
+        self.assertIsNone(new_name)
+        self.assertIn("matched no module", note)
+
+    def test_spec_tail_is_preserved_when_rewriting(self):
+        import repack_firmware as rp
+        got = rp.translate_specs(self.FIVE, ["vr2010_010000.bi:0x1000:dead"], ":")
+        self.assertEqual(got[0][1], "eg2010_0200i1.bi:0x1000:dead")
+        got = rp.translate_specs(self.DUAL, ["eg1850_sla_0170=/tmp/b.bin"], "=")
+        self.assertEqual(got[0][1], "eg1850_mas_0170=/tmp/b.bin")
+
+    def test_unresolvable_spec_carries_a_note_and_no_command(self):
+        import repack_firmware as rp
+        spec, fixed, note = rp.translate_specs(self.FIVE, ["zz9:0:00"], ":")[0]
+        self.assertIsNone(fixed)
+        self.assertTrue(note)
+
+    def test_new_flags_do_not_hit_the_gate(self):
         import repack_firmware as rp
         argv = ["repack_firmware.py", "--key", "/nonexistent", "--sig", "/nonexistent",
-                "--firmware", "/nonexistent", "--out", "/nonexistent/out.bin"]
-        argv += list(extra)
+                "--firmware", "/nonexistent", "--out", "/nonexistent/out.bin",
+                "--patch-module", "eg:0x1000:dead"]
         with mock.patch.object(sys, "argv", argv), \
                 contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(io.StringIO()) as errors:
+                contextlib.redirect_stderr(io.StringIO()):
             try:
                 code = rp.main()
             except SystemExit as exc:
                 code = exc.code
-        return code, errors.getvalue()
-
-    def test_patch_is_deprecated_and_translated(self):
-        code, errors = self.run_repack("--patch", "vr2070_010100.bi:0x1000:dead")
-        self.assertEqual(code, 9)
-        self.assertIn("deprecated", errors)
-        # 'vr' used to select the main application, which is now named 'eg'.
-        self.assertIn("--patch-module eg:0x1000:dead", errors)
-
-    def test_replace_is_deprecated_and_translated(self):
-        code, errors = self.run_repack("--replace", "li=/tmp/blob.bin")
-        self.assertEqual(code, 9)
-        self.assertIn("--replace-module vr=/tmp/blob.bin", errors)
-
-    def test_unrecognised_prefix_is_flagged_not_translated(self):
-        code, errors = self.run_repack("--patch", "zz9:0:00")
-        self.assertEqual(code, 9)
-        self.assertIn("not one of the renamed prefixes", errors)
-
-    def test_new_flags_are_not_deprecated(self):
-        # Must get past the deprecation gate and fail on the missing key instead.
-        code, _ = self.run_repack("--patch-module", "eg:0x1000:dead")
         self.assertNotEqual(code, 9)
 
 

@@ -64,19 +64,74 @@ EX_VERIFY = 8       # our own output failed re-validation
 EX_DEPRECATED = 9   # --patch/--replace: module names changed meaning, re-aim it
 
 
-# Module names used to be read from the PREVIOUS descriptor (see
-# decrypt_firmware.parse_table). The shift is by exactly one in every image, so
-# a name typed against the old tool can be translated without the file.
-RENAMED = [
-    ("_tpj01", "ex", "the external body-control micro"),
-    ("eg", "_tpj01", "the second micro"),
-    ("vr", "eg", "the main application"),
-    ("li", "vr", "the vibration-reduction unit (NikonBVR)"),
+# Module names used to be read from the PREVIOUS descriptor: the old reader
+# paired name[i+1] with extent[i] (see decrypt_firmware.parse_table). The shift
+# is POSITIONAL, not per-prefix, so the replacement for a name typed against the
+# old tool is the name of the record BEFORE it -- which can only be derived from
+# the directory in hand. A static prefix table is wrong as soon as a model has
+# two modules sharing a prefix: on a Z 6II/Z 7II, whose container carries an
+# `eg..._mas_...`/`eg..._sla_...` pair, old `eg..._sla_...` selected the extent
+# that is now named `eg..._mas_...`.
+
+# Descriptions are keyed on the CURRENT name, so they are safe to hard-code.
+DESCRIBES = [
+    ("ex", "the external body-control micro"),
+    ("_tpj01", "a second micro"),
+    ("eg", "the main application"),
+    ("vr", "the vibration-reduction unit (NikonBVR)"),
+    ("li", "the Linux image (NISI)"),
 ]
 
 
-def deprecation_notice(patches, replaces):
-    """Explain the rename and rewrite the user's own flags, then exit."""
+def describe(name):
+    for prefix, what in DESCRIBES:
+        if name.startswith(prefix):
+            return what
+    return "unidentified"
+
+
+def old_pairing(mods):
+    """Reconstruct what the old reader would have returned for this directory:
+    descriptor i's extent under descriptor i+1's name, last one unnamed."""
+    return [((mods[i + 1][0] if i + 1 < len(mods) else "(unnamed)"),
+             mods[i][1], mods[i][2]) for i in range(len(mods))]
+
+
+def resolve_as_old(mods, want):
+    """Apply the OLD selector to this directory. Returns (new_name, note)."""
+    old = old_pairing(mods)
+    hit = [m for m in old if m[0] == want] or [m for m in old if m[0].startswith(want)]
+    if not hit:
+        return None, "%r matched no module under the old naming either" % want
+    if len(hit) > 1:
+        return None, ("%r matched %d modules under the old naming, so the old "
+                      "tool refused it too" % (want, len(hit)))
+    start = hit[0][1]
+    now = [m for m in mods if m[1] == start]
+    if len(now) != 1:
+        return None, "could not identify the module at body 0x%x" % start
+    return now[0][0], None
+
+
+def translate_specs(mods, specs, sep):
+    """[(spec, new_spec_or_None, note_or_None)] for one deprecated flag."""
+    out = []
+    for spec in specs:
+        name = spec.split(sep, 1)[0]
+        new_name, note = resolve_as_old(mods, name)
+        if new_name is None:
+            out.append((spec, None, note))
+        else:
+            out.append((spec, new_name + spec[len(name):],
+                        "%r selected the extent now named %r (%s)"
+                        % (name, new_name, describe(new_name))))
+    return out
+
+
+def deprecation_notice(mods, patches, replaces):
+    """Explain the rename, rewrite the user's own flags from the directory in
+    hand, and exit. Never guesses: a selector that cannot be resolved gets an
+    explanation instead of a command line."""
     out = [
         "--patch and --replace are deprecated because module names changed meaning.",
         "",
@@ -86,41 +141,33 @@ def deprecation_notice(patches, replaces):
         "self-consistent -- but a command line written against it now resolves to the",
         "wrong module and would still succeed.",
         "",
-    ]
-    rows = [(o, w, n) for o, n, w in RENAMED] + [
-        ("(unnamed)", "the Linux image", "li")]
-    w0 = max(len(r[0]) for r in rows + [("name you typed",)])
-    w1 = max(len(r[1]) for r in rows + [(None, "was really")])
-    out.append("  %-*s  %-*s  %s" % (w0, "name you typed", w1, "was really",
-                                     "which is now called"))
-    out.append("  %s  %s  %s" % ("-" * w0, "-" * w1, "-" * 19))
-    for old_p, what, new_p in rows:
-        out.append("  %-*s  %-*s  %s" % (w0, old_p, w1, what, new_p))
-    out += [
-        "",
-        "Re-aim it and use the new flags, which have the corrected semantics:",
+        "For THIS image, old selector -> the module it actually chose:",
         "",
     ]
+    old = old_pairing(mods)
+    w0 = max([len(m[0]) for m in old] + [len("old name")])
+    w1 = max([len(m[0]) for m in mods] + [len("is now named")])
+    out.append("  %-*s  %-*s  %s" % (w0, "old name", w1, "is now named", "which is"))
+    out.append("  %s  %s  %s" % ("-" * w0, "-" * w1, "-" * 24))
+    for (old_name, start, _), now in zip(old, mods):
+        out.append("  %-*s  %-*s  %s" % (w0, old_name, w1, now[0], describe(now[0])))
 
-    def translate(spec, sep):
-        name = spec.split(sep, 1)[0]
-        for old_p, new_p, _ in RENAMED:
-            if name.startswith(old_p):
-                rest = spec[len(name):]
-                return "%s%s" % (new_p, rest), name, new_p
-        return spec, name, None
-
+    rewrites, blocked = [], []
     for flag, specs, sep in (("--patch-module", patches, ":"),
                              ("--replace-module", replaces, "=")):
-        for spec in specs:
-            fixed, name, new_p = translate(spec, sep)
-            if new_p:
-                out.append("  %s %s" % (flag, fixed))
-                out.append("      (%r used to mean the module now named %r)" % (name, new_p))
+        for spec, fixed, note in translate_specs(mods, specs, sep):
+            if fixed:
+                rewrites.append("  %s %s" % (flag, fixed))
+                rewrites.append("      (%s)" % note)
             else:
-                out.append("  %s %s" % (flag, spec))
-                out.append("      (%r is not one of the renamed prefixes; verify it yourself)"
-                           % name)
+                blocked.append("  %s %s" % (flag, spec))
+                blocked.append("      CANNOT VERIFY: %s." % note)
+                blocked.append("      Re-aim it yourself against the table above.")
+    if rewrites:
+        out += ["", "Re-aim it and use the new flags, which have the corrected "
+                    "semantics:", ""] + rewrites
+    if blocked:
+        out += ["", "No rewrite offered for:", ""] + blocked
     out += [
         "",
         "Then CHECK the 'module at body 0x...' line the repacker prints before you",
@@ -258,8 +305,6 @@ def main():
     ap.add_argument("--selftest", action="store_true",
                     help="repack with no edits; the output must be bit-identical to the input")
     args = ap.parse_args()
-    if args.patch or args.replace:
-        deprecation_notice(args.patch, args.replace)
     fw.refuse_clobber(args.out, args.force)
 
     if os.path.realpath(args.out) == os.path.realpath(args.firmware):
@@ -283,6 +328,11 @@ def main():
     except ValueError as exc:
         fw.die(fw.EX_SANITY, "%s: %s; refusing to start from a broken image."
                % (args.firmware, exc))
+
+    # The deprecation notice derives its advice from this directory, so it has to
+    # wait until the directory is in hand. Nothing is written before this point.
+    if args.patch or args.replace:
+        deprecation_notice(mods, args.patch, args.replace)
 
     # K8 belongs to one camera. If it does not verify the stock header, it is the
     # wrong key and every signature we write would be wrong too.
